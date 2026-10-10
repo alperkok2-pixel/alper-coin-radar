@@ -47,14 +47,27 @@ gate = threading.Lock()
 next_call = 0.0
 pause_until = 0.0
 
+class HTTPFailure(RuntimeError):
+    def __init__(self, source, status):
+        self.source, self.status = source, status
+        super().__init__(f'{source} HTTP {status}')
+
+def error_detail(exc):
+    # Only expose our own sanitized HTTP fields, never URLs or credentials.
+    return str(exc) if isinstance(exc, HTTPFailure) else type(exc).__name__
+
 def request(url, params=None, data=None, market=False):
     global next_call, pause_until
+    source = 'Binance' if market else 'Telegram'
     if market:
-        with gate:
-            delay = max(next_call, pause_until) - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-            next_call = time.monotonic() + .2  # at most 5 market requests/sec
+        while True:
+            with gate:
+                delay = max(next_call, pause_until) - time.monotonic()
+                if delay <= 0:
+                    next_call = time.monotonic() + .4
+                    break
+            # Release the lock and recheck cooldown before sending.
+            time.sleep(min(delay, 1.0))
     if params:
         url += '?' + urllib.parse.urlencode(params)
     payload = None if data is None else urllib.parse.urlencode(data).encode()
@@ -63,10 +76,14 @@ def request(url, params=None, data=None, market=False):
             return json.load(response)
     except urllib.error.HTTPError as exc:
         if market and exc.code in (418, 429):
+            try:
+                cooldown = max(120, float(exc.headers.get('Retry-After', '120')))
+            except (ValueError, TypeError):
+                cooldown = 120
             with gate:
-                pause_until = time.monotonic() + max(120, int(exc.headers.get('Retry-After', '120')))
-        # Avoid printing URLs containing Telegram credentials.
-        raise RuntimeError('HTTP status ' + str(exc.code)) from None
+                pause_until = max(pause_until, time.monotonic() + cooldown)
+            print('Binance rate limit: HTTP', exc.code, 'cooldown seconds:', round(cooldown), flush=True)
+        raise HTTPFailure(source, exc.code) from None
 
 def market(path, **params):
     return request(BASE + path, params, market=True)
@@ -137,12 +154,12 @@ def monitor():
                                             (sid, minutes, observed, price, gross,
                                              gross-float(os.getenv('COST_BPS', '15'))/100))
         except Exception as exc:
-            print('Evaluation error:', type(exc).__name__, flush=True)
+            print('Evaluation error:', error_detail(exc), flush=True)
         if enabled('RESULT_TRACKING'):
             try:
                 track_outcomes()
             except Exception as exc:
-                print('Outcome error:', type(exc).__name__, flush=True)
+                print('Outcome error:', error_detail(exc), flush=True)
         time.sleep(15)
 
 def pairing():
@@ -184,7 +201,7 @@ def main():
     if not TOKEN:
         raise RuntimeError('Missing TELEGRAM_TOKEN')
     init_db()
-    print('Diagnostics V2.1 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
+    print('Diagnostics V2.2 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
     send('ALPER Radar V2 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
     threading.Thread(target=monitor, daemon=True).start()
     while True:
@@ -246,10 +263,10 @@ def main():
                         found += 1
                     except Exception as exc:
                         errors += 1
-                        print('Symbol error:', type(exc).__name__, flush=True)
+                        print('Symbol error:', error_detail(exc), flush=True)
             print('Scan seconds:', round(time.monotonic()-start), 'alerts:', found, 'errors:', errors, flush=True)
         except Exception as exc:
-            print('Scan unavailable:', type(exc).__name__, flush=True)
+            print('Scan unavailable:', error_detail(exc), flush=True)
         time.sleep(max(5, 90-(time.monotonic()-start)))
 
 def self_test():
