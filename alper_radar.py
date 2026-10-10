@@ -167,9 +167,13 @@ def pairing():
 def scan_symbol(symbol, now_ms):
     raw = market('/fapi/v1/klines', symbol=symbol, interval='1m', limit=480)
     result = candidate(raw, now_ms)
+    if result:
+        print('Candidate:', symbol, result['side'], 'score:', result['score'], flush=True)
     if result and enabled('HTF_FILTER'):
         hourly = market('/fapi/v1/klines', symbol=symbol, interval='1h', limit=100)
-        if trend_direction(hourly, now_ms, 3600000) != result['side']:
+        hourly_side = trend_direction(hourly, now_ms, 3600000)
+        if hourly_side != result['side']:
+            print('Rejected:', symbol, result['side'], 'filter: HTF_1H', 'trend:', hourly_side or 'NEUTRAL', flush=True)
             return symbol, None
     return symbol, result
 
@@ -180,6 +184,7 @@ def main():
     if not TOKEN:
         raise RuntimeError('Missing TELEGRAM_TOKEN')
     init_db()
+    print('Diagnostics V2.1 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
     send('ALPER Radar V2 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
     threading.Thread(target=monitor, daemon=True).start()
     while True:
@@ -190,6 +195,7 @@ def main():
             if enabled('BTC_FILTER'):
                 btc = market('/fapi/v1/klines', symbol='BTCUSDT', interval='15m', limit=100)
                 btc_side = trend_direction(btc, now_ms, 900000)
+            print('BTC 15m direction:', (btc_side or 'NEUTRAL') if enabled('BTC_FILTER') else 'FILTER_OFF', 'SHORT enabled:', enabled('ENABLE_SHORT'), flush=True)
             info = market('/fapi/v1/exchangeInfo')
             all_symbols = {s['symbol'] for s in info['symbols'] if s['status']=='TRADING' and s['contractType']=='PERPETUAL' and s['quoteAsset']=='USDT'}
             tickers = market('/fapi/v1/ticker/24hr')
@@ -204,22 +210,28 @@ def main():
                         if not result:
                             continue
                         if enabled('BTC_FILTER') and result['side'] != btc_side:
+                            print('Rejected:', symbol, result['side'], 'filter: BTC', 'trend:', btc_side or 'NEUTRAL', flush=True)
                             continue
                         if not derivatives_filter(symbol, result):
+                            print('Rejected:', symbol, result['side'], 'filter:', result.get('rejection', 'DERIVATIVES'), flush=True)
                             continue
                         with connect() as con:
                             exists = con.execute('SELECT 1 FROM signals WHERE symbol=? AND (candle=? OR ts>?)',
                                                  (symbol, result['candle'], time.time()-900)).fetchone()
                             if exists:
+                                print('Rejected:', symbol, result['side'], 'filter: DUPLICATE_15M', flush=True)
                                 continue
                             quote = market('/fapi/v2/ticker/price', symbol=symbol)
                             entry = float(quote['price'])
                             stamp = time.time()
                             if stamp - (result['candle']/1000 + 300) > 120:
+                                print('Rejected:', symbol, result['side'], 'filter: STALE_CANDLE', flush=True)
                                 continue
                             if not 0 <= stamp-float(quote['time'])/1000 <= 30:
+                                print('Rejected:', symbol, result['side'], 'filter: STALE_QUOTE', flush=True)
                                 continue
                             if abs(entry-result['close']) > .5*result['atr']:
+                                print('Rejected:', symbol, result['side'], 'filter: PRICE_DRIFT', flush=True)
                                 continue
                             risk = 1.2*result['atr']
                             direction = 1 if result['side'] == 'LONG' else -1
@@ -230,6 +242,7 @@ def main():
                                         (symbol, stamp, entry, stop, target, result['score'], result['candle'], result['side']))
                         clock = dt.datetime.fromtimestamp(stamp, dt.timezone(dt.timedelta(hours=3))).strftime('%H:%M:%S')
                         send(f"{'DENEME | ' if PAPER else ''}{result['side']} ADAYI: {symbol}\nSaat (TR): {clock}\nKural puanı: {result['score']}/100 (olasılık değil)\nReferans fiyat: {entry:.8g}\nStop referansı: {stop:.8g}\nHedef referansı: {target:.8g}\nHacim: {result['volume']:.2f}x\nOI değişimi (15dk): {result.get('oi_text', 'filtre kapalı')}\nFonlama: {result.get('funding_text', 'filtre kapalı')}\nİzleme: sonraki 5 ve 15 dk. Seviyeler otomatik emir değildir.")
+                        print('Alert sent:', symbol, result['side'], flush=True)
                         found += 1
                     except Exception as exc:
                         errors += 1
@@ -336,23 +349,29 @@ def derivatives_filter(symbol, result):
     if enabled('FUNDING_FILTER'):
         premium=market('/fapi/v1/premiumIndex',symbol=symbol)
         if abs(time.time()-float(premium['time'])/1000)>120:
+            result['rejection'] = 'FUNDING_STALE'
             return False
         rate=float(premium['lastFundingRate'])
         # Reject costly crowded direction; this is a configurable heuristic.
         if d*rate>float(os.getenv('MAX_FUNDING_RATE','0.001')):
+            result['rejection'] = 'FUNDING_CROWDED'
             return False
         result['funding_text']=f'{rate*100:+.4f}%'
     if enabled('OI_FILTER'):
         rows=market('/futures/data/openInterestHist',symbol=symbol,period='5m',limit=4)
         if len(rows)!=4 or abs(time.time()-int(rows[-1]['timestamp'])/1000)>600:
+            result['rejection'] = 'OI_STALE_OR_MISSING'
             return False
         if any(int(y['timestamp'])-int(x['timestamp'])!=300000 for x,y in zip(rows,rows[1:])):
+            result['rejection'] = 'OI_DATA_GAP'
             return False
         first=float(rows[0]['sumOpenInterest'])
         if first<=0:
+            result['rejection'] = 'OI_INVALID'
             return False
         change=(float(rows[-1]['sumOpenInterest'])/first-1)*100
         if change<float(os.getenv('MIN_OI_CHANGE_PCT','0')):
+            result['rejection'] = 'OI_CHANGE'
             return False
         result['oi_text']=f'{change:+.2f}%'
     return True
