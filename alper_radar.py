@@ -1,28 +1,26 @@
-"""ALPER Coin Radar — V2 experimental LONG/SHORT candidate scanner, Python 3.11+.
+"""ALPER Radar V4.0 — experimental paper signal scanner, Python 3.11+.
 
-PHONE SETUP (no Binance account/API key required):
-1. Create a private GitHub repository and upload this file as alper_radar.py.
-2. Render: New > Background Worker > connect repository > Frankfurt.
-   Runtime Python; Build command: python -m py_compile alper_radar.py
-   Start command: python -u alper_radar.py
-3. Set TELEGRAM_TOKEN as a secret environment variable. Never put it in GitHub.
-4. Send /start to your bot. Set TELEGRAM_CHAT_ID to your own numeric chat ID.
-   To obtain it safely, set PAIRING_CODE to a random private phrase, deploy,
-   then send /pair YOUR_PHRASE to your bot. The worker prints ONLY the chat ID
-   in Render logs. Add that ID as TELEGRAM_CHAT_ID and remove PAIRING_CODE.
-5. PAPER_MODE defaults to 1. All messages are experimental, no orders placed.
-6. Optional DATA_DIR: mount persistent disk there to retain results over deploys.
-   Without a persistent disk Render can lose SQLite records on restart/deploy.
+Default SIGNAL_ENGINE=PULLBACK: established 15m/1h trend, a 5m pullback
+near EMA21 and directional close confirmation with volume. Alternative
+SIGNAL_ENGINE=V3 retains the retest/squeeze engine for comparisons.
+No measured improvement is claimed. Thresholds are unvalidated heuristics.
 
-Scans active USDT perpetual contracts, filters illiquid markets, uses completed
-5m/15m candles aggregated from 1m data. Polling, not tick-level prediction.
-Scores are rule points, NOT probabilities. Targets use ATR, not predictions.
-V2 includes optional BTC, 1h trend, retest, OI and funding filters, shorts,
-and 1m candle target/stop tracking. Ambiguous bars are never counted as wins.
-Evaluation is observed last-price return at/after +5/+15 minutes, with actual
-observation time stored; it is not an executable backtest or a real order fill model.
-Costs: COST_BPS is assumed round-trip commission + slippage (default 15 bps).
-Local check: python alper_radar.py --self-test
+Render: Build python -m py_compile alper_radar.py; Start python -u alper_radar.py.
+Keep TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in environment secrets, never in git.
+PAPER_MODE=1; no exchange account keys or order placement.
+Default maximum stop-reference distance MAX_RISK_PCT=1.5 is PRICE distance,
+not account risk or a guaranteed loss cap. MAX_24H_CHANGE_PCT=15 excludes
+large absolute 24h changes. Existing BTC/HTF/OI/funding filters remain active.
+REFERENCE stops/targets are not real orders. Gaps/slippage can exceed them.
+Use DATA_DIR on a persistent disk to retain records over restarts/deploys.
+
+Tests: python alper_radar.py --self-test
+Replay: python alper_radar.py --backtest --symbols BTCUSDT,ETHUSDT --days 7
+Optional --data local.json uses the documented schema in --backtest --help.
+Optional --output report.json. Fetch needs Binance access; do not use VPN
+or bypass geographic restrictions. Replay never sends Telegram messages.
+OI/funding/liquidity/24h cap are not replayed; see limitations in its report.
+Scores stored for V3 compatibility are not success probabilities.
 """
 import concurrent.futures as cf
 from collections import Counter
@@ -127,8 +125,10 @@ def market(path, **params):
 def send(message):
     if not TOKEN or not CHAT:
         return
-    request('https://api.telegram.org/bot' + TOKEN + '/sendMessage',
-            data={'chat_id': CHAT, 'text': message})
+    response = request('https://api.telegram.org/bot' + TOKEN + '/sendMessage',
+                       data={'chat_id': CHAT, 'text': message})
+    if not response.get('ok'):
+        raise RuntimeError('Telegram message was not accepted')
 
 def connect():
     con = sqlite3.connect(DB, timeout=30)
@@ -167,9 +167,21 @@ def ema(values, length):
         value += 2 / (length + 1) * (item - value)
     return value
 
+alert_delivery_lock = threading.Lock()
+
+def flush_alerts():
+    with alert_delivery_lock:
+        with connect() as con:
+            pending=con.execute("SELECT signal_id,message FROM alert_outbox WHERE sent=0 ORDER BY signal_id LIMIT 20").fetchall()
+            for sid,message in pending:
+                send(message)
+                con.execute("UPDATE alert_outbox SET sent=1 WHERE signal_id=?",(sid,))
+                con.commit()
+
 def monitor():
     while True:
         try:
+            flush_alerts()
             with connect() as con:
                 pending = con.execute('SELECT id,symbol,ts,entry,side FROM signals WHERE ts > ? AND NOT EXISTS (SELECT 1 FROM results WHERE signal_id=signals.id AND minutes=15)', (time.time()-7200,)).fetchall()
                 if pending:
@@ -222,7 +234,7 @@ def scan_symbol(symbol, now_ms):
     raw = market('/fapi/v1/klines', symbol=symbol, interval='1m', limit=480)
     result = candidate(raw, now_ms)
     if result:
-        print('Candidate:', symbol, result['side'], 'score:', result['score'], flush=True)
+        print('Candidate:', symbol, result['side'], 'method:', result['method'], flush=True)
     if result and enabled('HTF_FILTER'):
         hourly = market('/fapi/v1/klines', symbol=symbol, interval='1h', limit=100)
         hourly_side = trend_direction(hourly, now_ms, 3600000)
@@ -238,8 +250,9 @@ def main():
     if not TOKEN:
         raise RuntimeError('Missing TELEGRAM_TOKEN')
     init_db()
-    print('Diagnostics V3.0 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','SQUEEZE_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
-    send('ALPER Radar V3.0 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
+    print('Signal engine:', os.getenv('SIGNAL_ENGINE','PULLBACK'), 'max risk %:', os.getenv('MAX_RISK_PCT','1.5'), flush=True)
+    print('Diagnostics V4.0 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','SQUEEZE_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
+    send('ALPER Radar V4.0 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
     threading.Thread(target=monitor, daemon=True).start()
     while True:
         start = time.monotonic()
@@ -261,10 +274,12 @@ def main():
             all_symbols = {s['symbol'] for s in info['symbols'] if s['status']=='TRADING' and s['contractType']=='PERPETUAL' and s['quoteAsset']=='USDT'}
             tickers = market('/fapi/v1/ticker/24hr')
             liquid = [t['symbol'] for t in tickers if t['symbol'] in all_symbols and float(t['quoteVolume']) >= float(os.getenv('MIN_VOLUME_USDT', '20000000'))]
-            print('Active:', len(all_symbols), 'liquid:', len(liquid), flush=True)
+            changes = {t['symbol']: abs(float(t['priceChangePercent'])) for t in tickers}
+            eligible = [symbol for symbol in liquid if changes.get(symbol,0) <= float(os.getenv('MAX_24H_CHANGE_PCT','15'))]
+            print('Active:', len(all_symbols), 'liquid:', len(liquid), 'within 24h move cap:', len(eligible), flush=True)
             errors, found = 0, 0
             with cf.ThreadPoolExecutor(max_workers=4) as pool:
-                futures = [pool.submit(scan_symbol, s, now_ms) for s in liquid]
+                futures = [pool.submit(scan_symbol, s, now_ms) for s in eligible]
                 for future in cf.as_completed(futures):
                     try:
                         symbol, result = future.result()
@@ -294,16 +309,19 @@ def main():
                             if abs(entry-result['close']) > .5*result['atr']:
                                 print('Rejected:', symbol, result['side'], 'filter: PRICE_DRIFT', flush=True)
                                 continue
-                            risk = 1.2*result['atr']
-                            direction = 1 if result['side'] == 'LONG' else -1
-                            stop, target = entry-direction*risk, entry+direction*1.5*risk
-                            if min(stop, target) <= 0:
+                            levels = trade_levels(result, entry)
+                            if levels is None:
+                                print('Rejected:', symbol, result['side'], 'filter: RISK_OR_COST', flush=True)
                                 continue
-                            con.execute('INSERT INTO signals(symbol,ts,entry,stop,target,score,candle,side,method) VALUES (?,?,?,?,?,?,?,?,?)',
+                            stop, target, risk_pct = levels
+                            clock = dt.datetime.fromtimestamp(stamp, dt.timezone(dt.timedelta(hours=3))).strftime('%H:%M:%S')
+                            alert_message = f"{'DENEME | ' if PAPER else ''}{result['side']} ADAYI: {symbol}\nYöntem: {METHOD_LABELS[result['method']]}\nSaat (TR): {clock}\nDurum: deneysel aday; başarı olasılığı hesaplanmadı\nReferans fiyat: {entry:.8g}\nStop mesafesi: %{risk_pct:.2f}\nStop referansı: {stop:.8g}\nHedef referansı: {target:.8g}\nHacim: {result['volume']:.2f}x\nOI değişimi (15dk): {result.get('oi_text', 'filtre kapalı')}\nFonlama: {result.get('funding_text', 'filtre kapalı')}\nİzleme: sonraki 5 ve 15 dk. Seviyeler otomatik emir değildir."
+                            cursor = con.execute('INSERT INTO signals(symbol,ts,entry,stop,target,score,candle,side,method) VALUES (?,?,?,?,?,?,?,?,?)',
                                         (symbol, stamp, entry, stop, target, result['score'], result['candle'], result['side'], result['method']))
-                        clock = dt.datetime.fromtimestamp(stamp, dt.timezone(dt.timedelta(hours=3))).strftime('%H:%M:%S')
-                        send(f"{'DENEME | ' if PAPER else ''}{result['side']} ADAYI: {symbol}\nYöntem: {METHOD_LABELS[result['method']]}\nSaat (TR): {clock}\nKural puanı: {result['score']}/100 (olasılık değil)\nReferans fiyat: {entry:.8g}\nStop referansı: {stop:.8g}\nHedef referansı: {target:.8g}\nHacim: {result['volume']:.2f}x\nOI değişimi (15dk): {result.get('oi_text', 'filtre kapalı')}\nFonlama: {result.get('funding_text', 'filtre kapalı')}\nİzleme: sonraki 5 ve 15 dk. Seviyeler otomatik emir değildir.")
-                        print('Alert sent:', symbol, result['side'], flush=True)
+                            con.execute('INSERT INTO alert_outbox(signal_id,message) VALUES (?,?)',(cursor.lastrowid,alert_message))
+                        flush_alerts()
+
+                        print('Alert delivery processed:', symbol, result['side'], flush=True)
                         found += 1
                     except MarketPaused:
                         errors += 1
@@ -329,7 +347,8 @@ def self_test():
     assert ema([10]*30, 9) == 10
     assert len(aggregate(raw[:4], 5, 480*60000)) == 0
     import tempfile
-    global DB
+    global DB, send
+    saved_db, saved_send = DB, send
     with tempfile.TemporaryDirectory() as directory:
         DB = str(Path(directory)/'test.sqlite3')
         init_db()
@@ -338,7 +357,24 @@ def self_test():
             con.execute('INSERT INTO results VALUES (1,5,301,101,1,.85)')
             con.execute('INSERT OR IGNORE INTO results VALUES (1,5,302,102,2,1.85)')
             assert con.execute('SELECT count(*) FROM results').fetchone()[0] == 1
-    print('PASS: candle alignment, partial/gapped bars, EMA, neutral-market rejection.')
+        with connect() as con:
+            con.execute('INSERT INTO alert_outbox VALUES (1,?,0)', ('TEST ONLY',))
+        def fail_send(message):
+            raise RuntimeError('simulated delivery failure')
+        send = fail_send
+        try:
+            flush_alerts()
+        except RuntimeError:
+            pass
+        with connect() as con:
+            assert con.execute('SELECT sent FROM alert_outbox').fetchone()[0] == 0
+        deliveries = []
+        send = deliveries.append
+        flush_alerts()
+        flush_alerts()
+        assert deliveries == ['TEST ONLY']
+    DB, send = saved_db, saved_send
+    print('PASS: candle alignment, partial/gapped bars, EMA, neutral-market rejection, DB migration and delivery retry.')
 
 
 # Independent signal paths: RETEST_FILTER and SQUEEZE_FILTER (default ON).
@@ -378,7 +414,7 @@ def retest_setup(a, atr, direction):
             return ratio
     return None
 
-METHOD_LABELS = {'RETEST': 'Geri test', 'SQUEEZE_BREAKOUT': 'Sıkışma–kırılım', 'LEGACY': 'Önceki sürüm'}
+METHOD_LABELS = {'RETEST': 'Geri test', 'SQUEEZE_BREAKOUT': 'Sıkışma–kırılım', 'LEGACY': 'Önceki sürüm', 'PULLBACK': 'Trend içinde geri çekilme + kapanış teyidi'}
 
 def squeeze_breakout(a, direction):
     # Compare only pre-breakout candles: 12 recent ranges vs 24 earlier ranges.
@@ -400,7 +436,7 @@ def squeeze_breakout(a, direction):
         return ratio
     return None
 
-def candidate(raw, now_ms):
+def legacy_candidate(raw, now_ms):
     a, b = aggregate(raw,5,now_ms), aggregate(raw,15,now_ms)
     if len(a)<30 or len(b)<25:
         return reject_candidate('INSUFFICIENT_BARS')
@@ -449,6 +485,81 @@ def candidate(raw, now_ms):
             return dict(side=side,score=score,atr=atr,close=last[4],candle=last[0],volume=volume,method=method)
     return reject_candidate('|'.join(failures) or 'NO_SETUP')
 
+def ema_series(values, length):
+    out = [values[0]]
+    for value in values[1:]:
+        out.append(out[-1] + 2/(length+1)*(value-out[-1]))
+    return out
+
+def pullback_candidate(raw, now_ms):
+    a, b = aggregate(raw,5,now_ms), aggregate(raw,15,now_ms)
+    if len(a)<60 or len(b)<25:
+        return reject_candidate('INSUFFICIENT_BARS')
+    if now_ms-(a[-1][0]+300000)>90000:
+        return reject_candidate('CANDLE_WINDOW')
+    if any(y[0]-x[0]!=300000 for x,y in zip(a,a[1:])) or any(y[0]-x[0]!=900000 for x,y in zip(b,b[1:])):
+        return reject_candidate('DATA_GAP')
+    closes, big = [r[4] for r in a], [r[4] for r in b]
+    fast, slow = ema_series(closes,9), ema_series(closes,21)
+    atr = st.mean(max(a[i][2]-a[i][3],abs(a[i][2]-a[i-1][4]),abs(a[i][3]-a[i-1][4])) for i in range(len(a)-14,len(a)))
+    if atr<=0 or closes[-1]<=0:
+        return reject_candidate('INVALID_ATR')
+    last = a[-1]
+    volume = last[5]/max(st.mean(r[5] for r in a[-21:-1]),1e-12)
+    location = (last[4]-last[3])/max(last[2]-last[3],1e-12)
+    reasons = []
+    for side,d in [('LONG',1),('SHORT',-1)]:
+        if side=='SHORT' and not enabled('ENABLE_SHORT'):
+            continue
+        # Established trend and slope must predate the signal candle.
+        trend = (d*(big[-1]-ema(big,9))>0 and d*(ema(big,9)-ema(big,21))>0
+                 and d*(slow[-2]-slow[-6])>.1*atr
+                 and d*(fast[-2]-slow[-2])>0)
+        if not trend:
+            reasons.append(side+'_TREND'); continue
+        touched = any(a[i][3] <= slow[i]+.25*atr and a[i][2] >= slow[i]-.25*atr for i in range(len(a)-4,len(a)-1))
+        held = all(d*(a[i][4]-slow[i]) >= -.35*atr for i in range(len(a)-4,len(a)-1))
+        reversed_close = d*(last[4]-(a[-2][2] if d==1 else a[-2][3]))>0
+        strong = location>=.7 if d==1 else location<=.3
+        extension = d*(last[4]-slow[-1])/atr
+        if not (touched and held):
+            reasons.append(side+'_PULLBACK'); continue
+        if not (reversed_close and strong and d*(last[4]-last[1])>0 and d*(last[4]-fast[-1])>0):
+            reasons.append(side+'_CLOSE_CONFIRMATION'); continue
+        if volume<1.3:
+            reasons.append(side+'_VOLUME'); continue
+        if not 0<extension<1.5 or last[2]-last[3]>2*atr:
+            reasons.append(side+'_OVEREXTENDED'); continue
+        stop = min(r[3] for r in a[-4:])-.15*atr if d==1 else max(r[2] for r in a[-4:])+.15*atr
+        result = dict(side=side,score=0,atr=atr,close=last[4],candle=last[0],volume=volume,method='PULLBACK',structure_stop=stop)
+        if trade_levels(result,last[4]) is None:
+            reasons.append(side+'_RISK_OR_COST'); continue
+        return result
+    return reject_candidate('|'.join(reasons) or 'NO_SETUP')
+
+def candidate(raw, now_ms):
+    engine = os.getenv('SIGNAL_ENGINE','PULLBACK').upper()
+    if engine == 'V3':
+        return legacy_candidate(raw,now_ms)
+    if engine != 'PULLBACK':
+        raise ValueError('SIGNAL_ENGINE must be PULLBACK or V3')
+    return pullback_candidate(raw,now_ms)
+
+def trade_levels(result,entry):
+    if entry<=0 or result['atr']<=0:
+        return None
+    d = 1 if result['side']=='LONG' else -1
+    stop = result.get('structure_stop',entry-d*1.2*result['atr'])
+    risk = d*(entry-stop)
+    risk_pct = risk/entry*100
+    minimum = max(float(os.getenv('MIN_RISK_PCT','0.25')),2*float(os.getenv('COST_BPS','15'))/100)
+    if not minimum<=risk_pct<=float(os.getenv('MAX_RISK_PCT','1.5')):
+        return None
+    target = entry+d*1.5*risk
+    if min(stop,target)<=0:
+        return None
+    return stop,target,risk_pct
+
 def derivatives_filter(symbol, result):
     d=1 if result['side']=='LONG' else -1
     if enabled('FUNDING_FILTER'):
@@ -475,6 +586,7 @@ def derivatives_filter(symbol, result):
             result['rejection'] = 'OI_INVALID'
             return False
         change=(float(rows[-1]['sumOpenInterest'])/first-1)*100
+        print('OI check:', symbol, 'change %:', round(change,4), 'minimum %:', os.getenv('MIN_OI_CHANGE_PCT','0'), flush=True)
         if change<float(os.getenv('MIN_OI_CHANGE_PCT','0')):
             result['rejection'] = 'OI_CHANGE'
             return False
@@ -490,6 +602,7 @@ def init_db():
             con.execute("ALTER TABLE signals ADD COLUMN side TEXT NOT NULL DEFAULT 'LONG'")
         if 'method' not in columns:
             con.execute("ALTER TABLE signals ADD COLUMN method TEXT NOT NULL DEFAULT 'LEGACY'")
+        con.execute('CREATE TABLE IF NOT EXISTS alert_outbox (signal_id INTEGER PRIMARY KEY, message TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0)')
         con.execute('CREATE TABLE IF NOT EXISTS diagnostics (signal_id INTEGER PRIMARY KEY, approach_pct REAL, adverse_pct REAL, coverage TEXT, notified INTEGER DEFAULT 0)')
         con.execute('CREATE TABLE IF NOT EXISTS outcomes (signal_id INTEGER PRIMARY KEY, status TEXT, observed REAL, reference_price REAL, notified INTEGER DEFAULT 0)')
 
@@ -605,8 +718,139 @@ def track_diagnostics():
             con.execute('UPDATE diagnostics SET notified=1 WHERE signal_id=?',(sid,))
 
 
+def historical_rows(symbol, interval, start_ms, end_ms):
+    widths = {'1m':60000,'15m':900000,'1h':3600000}
+    out, cursor = [], start_ms
+    while cursor<end_ms:
+        rows = market('/fapi/v1/klines',symbol=symbol,interval=interval,startTime=cursor,endTime=end_ms-1,limit=1000)
+        if not rows:
+            break
+        out.extend(rows)
+        following = int(rows[-1][0])+widths[interval]
+        if following<=cursor:
+            raise RuntimeError('Historical pagination did not advance')
+        cursor=following
+    return out
+
+def replay_trade(rows,entry_ms,result):
+    # Entry at a subsequent 1m OPEN, 2m after signal close, to model scan delay.
+    bars=[r for r in rows if entry_ms<=int(r[0])<entry_ms+900000]
+    if len(bars)!=15 or [int(r[0]) for r in bars]!=list(range(entry_ms,entry_ms+900000,60000)):
+        return None
+    entry=float(bars[0][1])
+    if abs(entry-result['close'])>.5*result['atr']:
+        return None
+    if result['method']=='PULLBACK':
+        levels=trade_levels(result,entry)
+        if levels is None: return None
+        stop,target,_=levels
+    else:
+        d=1 if result['side']=='LONG' else -1
+        stop,target=entry-d*1.2*result['atr'],entry+d*1.8*result['atr']
+    status,price='TIMEOUT',float(bars[-1][4])
+    d=1 if result['side']=='LONG' else -1
+    for row in bars:
+        high,low=float(row[2]),float(row[3])
+        hit_stop=low<=stop if d==1 else high>=stop
+        hit_target=high>=target if d==1 else low<=target
+        if hit_stop or hit_target:
+            status='AMBIGUOUS_STOP_ASSUMED' if hit_stop and hit_target else ('STOP' if hit_stop else 'TARGET')
+            price=stop if hit_stop else target
+            break
+    net=d*(price/entry-1)*100-float(os.getenv('COST_BPS','15'))/100
+    return dict(entry_ms=entry_ms,method=result['method'],side=result['side'],status=status,net_pct=net)
+
+def run_backtest_cli():
+    import argparse,bisect
+    parser=argparse.ArgumentParser(description='V3 vs pullback replay; experimental, no Telegram or orders.')
+    parser.add_argument('--backtest',action='store_true')
+    parser.add_argument('--data',help='Local JSON with symbols:{SYMBOL:{1m:[klines],1h:[klines]}}, btc15m:[klines]')
+    parser.add_argument('--symbols',default='BTCUSDT,ETHUSDT')
+    parser.add_argument('--days',type=int,default=7)
+    parser.add_argument('--output',help='Optional JSON report path')
+    args=parser.parse_args()
+    if args.data:
+        data=json.loads(Path(args.data).read_text())
+    else:
+        if not 1<=args.days<=30: parser.error('--days must be 1..30')
+        end=int(market('/fapi/v1/time')['serverTime'])//60000*60000
+        start=end-args.days*86400000
+        warm=start-60*3600000
+        data={'symbols':{},'btc15m':historical_rows('BTCUSDT','15m',warm,end)}
+        for symbol in args.symbols.split(','):
+            symbol=symbol.strip().upper()
+            if not symbol.isalnum(): parser.error('Invalid symbol')
+            data['symbols'][symbol]={'1m':historical_rows(symbol,'1m',warm,end),'1h':historical_rows(symbol,'1h',warm,end)}
+        data['evaluation_start_ms']=start
+    btc=data['btc15m']
+    btc_times=[int(r[0]) for r in btc]
+    trades={'V3':[],'PULLBACK':[]}
+    boundaries=[]
+    # Freeze common filter settings. OI/funding cannot be reconstructed from these candles.
+    original={key:os.environ.get(key) for key in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','SQUEEZE_FILTER')}
+    for key in original: os.environ[key]='1'
+    try:
+        for symbol,frames in data['symbols'].items():
+            raw,hourly=frames['1m'],frames['1h']
+            for rows,width in ((raw,60000),(hourly,3600000),(btc,900000)):
+                if not rows or any(int(b[0])-int(a[0])!=width for a,b in zip(rows,rows[1:])):
+                    raise ValueError('Missing, unordered or gapped historical candles')
+            hourly_times=[int(r[0]) for r in hourly]
+            evaluation_start=max(int(data.get('evaluation_start_ms',raw[0][0])),int(raw[0][0])+60*3600000)
+            last_entry={'V3':-1e30,'PULLBACK':-1e30}
+            end_ms=int(raw[-1][0])+60000
+            boundary=evaluation_start+(end_ms-evaluation_start)*.7
+            boundaries.append(boundary)
+            for index in range(480,len(raw)-17):
+                close_ms=int(raw[index][0])
+                if close_ms<evaluation_start or close_ms%300000: continue
+                now_ms=close_ms+5000
+                window=raw[index-480:index]
+                hpos=bisect.bisect_right(hourly_times,now_ms)
+                hside=trend_direction(hourly[max(0,hpos-101):hpos],now_ms,3600000)
+                bpos=bisect.bisect_right(btc_times,now_ms)
+                bside=trend_direction(btc[max(0,bpos-101):bpos],now_ms,900000)
+                for engine,function in (('V3',legacy_candidate),('PULLBACK',pullback_candidate)):
+                    if close_ms-last_entry[engine]<900000: continue
+                    result=function(window,now_ms)
+                    if not result or hside!=result['side'] or not btc_allows(result['side'],bside): continue
+                    item=replay_trade(raw[index:index+17],close_ms+120000,result)
+                    if item:
+                        item.update(symbol=symbol,segment='EARLIER_70_PERCENT' if close_ms<boundary else 'HOLDOUT_30_PERCENT')
+                        trades[engine].append(item);last_entry[engine]=item['entry_ms']
+    finally:
+        for key,value in original.items():
+            if value is None: os.environ.pop(key,None)
+            else: os.environ[key]=value
+    summaries={}
+    for engine,items in trades.items():
+        summaries[engine]={}
+        for segment in ('EARLIER_70_PERCENT','HOLDOUT_30_PERCENT'):
+            selected=sorted([t for t in items if t['segment']==segment],key=lambda t:t['entry_ms'])
+            returns=[t['net_pct'] for t in selected]
+            cumulative,peak,drawdown=0.,0.,0.
+            for value in returns:
+                cumulative+=value;peak=max(peak,cumulative);drawdown=max(drawdown,peak-cumulative)
+            summaries[engine][segment]={'count':len(selected),'statuses':dict(Counter(t['status'] for t in selected)),
+                'positive_net_fraction':sum(x>0 for x in returns)/len(returns) if returns else None,
+                'mean_net_pct':st.mean(returns) if returns else None,
+                'sum_net_pct_points':sum(returns),'drawdown_pct_points_equal_notional':drawdown}
+    report={'limitations':['No measured performance until actual historical data is supplied.',
+        'OI, funding, historical liquidity and 24h movement caps are NOT replayed; selected symbols may have selection bias.',
+        'Entry assumes 2m scan delay then 1m open, 15m horizon, configured round-trip cost; stops assume reference fills, no gap fill model.',
+        'Same-bar stop/target ambiguity assumes stop; reported separately. Not executable live PnL.',
+        'Earlier/holdout split is chronological; manual tuning after viewing holdout invalidates it.',
+        'Aggregated sums use equal notionals and can overlap across symbols; not a portfolio return.'],
+        'summaries':summaries,'trades':trades}
+    output=json.dumps(report,ensure_ascii=False,indent=2)
+    if args.output: Path(args.output).write_text(output)
+    print(output)
+
+
 if __name__ == '__main__':
-    if '--self-test' in sys.argv:
+    if '--backtest' in sys.argv:
+        run_backtest_cli()
+    elif '--self-test' in sys.argv:
         self_test()
     else:
         main()
