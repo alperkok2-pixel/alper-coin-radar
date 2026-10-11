@@ -46,6 +46,9 @@ DB = str(Path(os.getenv('DATA_DIR', '.')) / 'radar.sqlite3')
 gate = threading.Lock()
 next_call = 0.0
 pause_until = 0.0
+market_io = threading.Lock()
+rate_failures = 0
+last_rate_failure = 0.0
 
 class HTTPFailure(RuntimeError):
     def __init__(self, source, status):
@@ -56,15 +59,27 @@ def error_detail(exc):
     # Only expose our own sanitized HTTP fields, never URLs or credentials.
     return str(exc) if isinstance(exc, HTTPFailure) else type(exc).__name__
 
+class MarketPaused(RuntimeError):
+    pass
+
 def request(url, params=None, data=None, market=False):
-    global next_call, pause_until
+    if market:
+        # Serialize all scanner and monitor traffic, including rate-limit handling.
+        with market_io:
+            return _request(url, params, data, market=True)
+    return _request(url, params, data, market=False)
+
+def _request(url, params=None, data=None, market=False):
+    global next_call, pause_until, rate_failures, last_rate_failure
     source = 'Binance' if market else 'Telegram'
     if market:
         while True:
             with gate:
-                delay = max(next_call, pause_until) - time.monotonic()
+                if time.monotonic() < pause_until:
+                    raise MarketPaused("Binance cooldown active")
+                delay = next_call - time.monotonic()
                 if delay <= 0:
-                    next_call = time.monotonic() + .4
+                    next_call = time.monotonic() + max(1.0, float(os.getenv("REQUEST_INTERVAL_SECONDS", "1.0")))
                     break
             # Release the lock and recheck cooldown before sending.
             time.sleep(min(delay, 1.0))
@@ -77,9 +92,14 @@ def request(url, params=None, data=None, market=False):
     except urllib.error.HTTPError as exc:
         if market and exc.code in (418, 429):
             try:
-                cooldown = max(120, float(exc.headers.get('Retry-After', '120')))
+                retry_after = max(0, float(exc.headers.get('Retry-After', '0')))
             except (ValueError, TypeError):
-                cooldown = 120
+                retry_after = 0
+            current = time.monotonic()
+            rate_failures = 1 if current-last_rate_failure > 3600 else rate_failures+1
+            last_rate_failure = current
+            cooldown = max(retry_after, min(3600, 300 * 2**min(rate_failures-1, 4)),
+                           900 if exc.code == 418 else 0)
             with gate:
                 pause_until = max(pause_until, time.monotonic() + cooldown)
             print('Binance rate limit: HTTP', exc.code, 'cooldown seconds:', round(cooldown), flush=True)
@@ -161,7 +181,7 @@ def monitor():
                 track_diagnostics()
             except Exception as exc:
                 print('Outcome error:', error_detail(exc), flush=True)
-        time.sleep(15)
+        time.sleep(30)
 
 def pairing():
     code = os.getenv('PAIRING_CODE', '')
@@ -202,11 +222,14 @@ def main():
     if not TOKEN:
         raise RuntimeError('Missing TELEGRAM_TOKEN')
     init_db()
-    print('Diagnostics V2.2 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
-    send('ALPER Radar V2.3 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
+    print('Diagnostics V2.4 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
+    send('ALPER Radar V2.4 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
     threading.Thread(target=monitor, daemon=True).start()
     while True:
         start = time.monotonic()
+        if start < pause_until:
+            time.sleep(min(30, pause_until-start))
+            continue
         try:
             now_ms = int(market('/fapi/v1/time')['serverTime'])
             btc_side = None
@@ -262,13 +285,18 @@ def main():
                         send(f"{'DENEME | ' if PAPER else ''}{result['side']} ADAYI: {symbol}\nSaat (TR): {clock}\nKural puanı: {result['score']}/100 (olasılık değil)\nReferans fiyat: {entry:.8g}\nStop referansı: {stop:.8g}\nHedef referansı: {target:.8g}\nHacim: {result['volume']:.2f}x\nOI değişimi (15dk): {result.get('oi_text', 'filtre kapalı')}\nFonlama: {result.get('funding_text', 'filtre kapalı')}\nİzleme: sonraki 5 ve 15 dk. Seviyeler otomatik emir değildir.")
                         print('Alert sent:', symbol, result['side'], flush=True)
                         found += 1
+                    except MarketPaused:
+                        errors += 1
+                        for queued in futures:
+                            queued.cancel()
+                        break
                     except Exception as exc:
                         errors += 1
                         print('Symbol error:', error_detail(exc), flush=True)
             print('Scan seconds:', round(time.monotonic()-start), 'alerts:', found, 'errors:', errors, flush=True)
         except Exception as exc:
             print('Scan unavailable:', error_detail(exc), flush=True)
-        time.sleep(max(5, 90-(time.monotonic()-start)))
+        time.sleep(max(5, max(180, float(os.getenv("SCAN_INTERVAL_SECONDS", "180")))-(time.monotonic()-start)))
 
 def self_test():
     raw = [[i*60000, '10', '12', '9', '11', '1', (i+1)*60000-1, '100'] for i in range(480)]
