@@ -1,4 +1,4 @@
-"""ALPER Radar V4.0 — experimental paper signal scanner, Python 3.11+.
+"""ALPER Radar V4.1 — experimental paper signal scanner, Python 3.11+.
 
 Default SIGNAL_ENGINE=PULLBACK: established 15m/1h trend, a 5m pullback
 near EMA21 and directional close confirmation with volume. Alternative
@@ -8,12 +8,28 @@ No measured improvement is claimed. Thresholds are unvalidated heuristics.
 Render: Build python -m py_compile alper_radar.py; Start python -u alper_radar.py.
 Keep TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in environment secrets, never in git.
 PAPER_MODE=1; no exchange account keys or order placement.
+V4.1: pinned closed-bar snapshots, rotating 24-symbol batches, weighted request
+budget, hourly/metadata cache, shared-IP weight backoff and health messages.
+The rotating universe means not every symbol is scanned every 5 minutes.
+429 cannot be eliminated on shared hosting. No strategy improvement is claimed.
 Default maximum stop-reference distance MAX_RISK_PCT=1.5 is PRICE distance,
 not account risk or a guaranteed loss cap. MAX_24H_CHANGE_PCT=15 excludes
 large absolute 24h changes. Existing BTC/HTF/OI/funding filters remain active.
 REFERENCE stops/targets are not real orders. Gaps/slippage can exceed them.
 Use DATA_DIR on a persistent disk to retain records over restarts/deploys.
 
+Recommended Render environment (keep existing Telegram secrets):
+REQUEST_INTERVAL_SECONDS=2
+MAX_SYMBOLS_PER_SCAN=24
+WEIGHT_BUDGET_PER_MINUTE=180
+IP_WEIGHT_SOFT_LIMIT=1200
+SIGNAL_ENGINE=PULLBACK
+PAPER_MODE=1
+MIN_TREND_EFFICIENCY=0.25
+Keep exactly one Render instance/service for this scanner. These settings
+reduce our traffic; they cannot control traffic from other users of an IP.
+Health notification every 30m and immediately on rate-limit errors.
+Live result summary: python alper_radar.py --stats
 Tests: python alper_radar.py --self-test
 Replay: python alper_radar.py --backtest --symbols BTCUSDT,ETHUSDT --days 7
 Optional --data local.json uses the documented schema in --backtest --help.
@@ -23,6 +39,7 @@ OI/funding/liquidity/24h cap are not replayed; see limitations in its report.
 Scores stored for V3 compatibility are not success probabilities.
 """
 import concurrent.futures as cf
+from collections import deque
 from collections import Counter
 import datetime as dt
 import json
@@ -49,6 +66,68 @@ market_io = threading.Lock()
 rate_failures = 0
 last_rate_failure = 0.0
 scan_reasons = Counter()
+weight_events = deque()
+market_cache = {}
+cache_lock = threading.Lock()
+last_health = 0.0
+scan_offset = 0
+
+def endpoint_weight(url, params):
+    path = urllib.parse.urlsplit(url).path
+    params = params or {}
+    if path.endswith('/klines'):
+        limit = int(params.get('limit', 500))
+        return 1 if limit < 100 else 2 if limit < 500 else 5 if limit <= 1000 else 10
+    if path.endswith('/ticker/24hr'):
+        return 1 if params.get('symbol') else 40
+    if path.endswith('/ticker/price'):
+        return 2 if params.get('symbol') else 4
+    if path.endswith('/premiumIndex'):
+        return 1 if params.get('symbol') else 10
+    return 1
+
+def cached_market(path, ttl, **params):
+    # Cache only immutable metadata or requests with explicit short validity.
+    key = (path, tuple(sorted(params.items())))
+    with cache_lock:
+        hit = market_cache.get(key)
+        if hit and time.monotonic() - hit[0] < ttl:
+            return hit[1]
+    value = market(path, **params)
+    with cache_lock:
+        if len(market_cache) > 2000:
+            market_cache.clear()
+        market_cache[key] = (time.monotonic(), value)
+    return value
+
+def select_scan_batch(eligible):
+    global scan_offset
+    cap = max(1, min(40, int(os.getenv('MAX_SYMBOLS_PER_SCAN', '24'))))
+    if not eligible:
+        return []
+    offset = scan_offset % len(eligible)
+    batch = (eligible[offset:] + eligible[:offset])[:cap]
+    scan_offset = (offset + len(batch)) % len(eligible)
+    return batch
+
+def wait_for_close():
+    # Initial deployment and recovery also wait for a fresh 5m close.
+    while True:
+        phase = time.time() % 300
+        if 5 <= phase <= 15:
+            return
+        delay = 5 - phase if phase < 5 else 305 - phase
+        time.sleep(min(30, delay))
+
+def health(message, force=False):
+    global last_health
+    if force or time.monotonic() - last_health >= 1800:
+        try:
+            send('ALPER Radar DURUM | ' + message)
+            last_health = time.monotonic()
+        except Exception as exc:
+            print('Health delivery error:', error_detail(exc), flush=True)
+
 reasons_lock = threading.Lock()
 
 def reject_candidate(reason):
@@ -91,9 +170,17 @@ def _request(url, params=None, data=None, market=False):
             with gate:
                 if time.monotonic() < pause_until:
                     raise MarketPaused("Binance cooldown active")
-                delay = next_call - time.monotonic()
+                current = time.monotonic()
+                while weight_events and current - weight_events[0][0] >= 60:
+                    weight_events.popleft()
+                cost = endpoint_weight(url, params)
+                budget = max(50, int(os.getenv('WEIGHT_BUDGET_PER_MINUTE', '180')))
+                delay = next_call - current
+                if sum(w for _, w in weight_events) + cost > budget:
+                    delay = max(delay, weight_events[0][0] + 60 - current)
                 if delay <= 0:
-                    next_call = time.monotonic() + max(1.0, float(os.getenv("REQUEST_INTERVAL_SECONDS", "1.0")))
+                    next_call = time.monotonic() + max(2.0, float(os.getenv("REQUEST_INTERVAL_SECONDS", "2.0")))
+                    weight_events.append((time.monotonic(), cost))
                     break
             # Release the lock and recheck cooldown before sending.
             time.sleep(min(delay, 1.0))
@@ -102,6 +189,13 @@ def _request(url, params=None, data=None, market=False):
     payload = None if data is None else urllib.parse.urlencode(data).encode()
     try:
         with urllib.request.urlopen(url, payload, timeout=15) as response:
+            if market:
+                used = int(response.headers.get('X-MBX-USED-WEIGHT-1M', '0'))
+                threshold = max(50, int(os.getenv('IP_WEIGHT_SOFT_LIMIT', '1200')))
+                if used >= threshold:
+                    with gate:
+                        pause_until = max(pause_until, time.monotonic() + 65)
+                    print('Shared IP weight high; pausing 65 seconds:', used, flush=True)
             return json.load(response)
     except urllib.error.HTTPError as exc:
         if market and exc.code in (418, 429):
@@ -117,6 +211,7 @@ def _request(url, params=None, data=None, market=False):
             with gate:
                 pause_until = max(pause_until, time.monotonic() + cooldown)
             print('Binance rate limit: HTTP', exc.code, 'cooldown seconds:', round(cooldown), flush=True)
+            health(f'Binance HTTP {exc.code}; tarama {round(cooldown/60)} dk bekliyor. Sinyal ve sonuç verileri bu arada eksik olabilir.', force=True)
         raise HTTPFailure(source, exc.code) from None
 
 def market(path, **params):
@@ -172,6 +267,8 @@ alert_delivery_lock = threading.Lock()
 def flush_alerts():
     with alert_delivery_lock:
         with connect() as con:
+            con.execute('UPDATE alert_outbox SET sent=2 WHERE sent=0 AND signal_id IN (SELECT id FROM signals WHERE ts<?)', (time.time()-120,))
+            con.commit()
             pending=con.execute("SELECT signal_id,message FROM alert_outbox WHERE sent=0 ORDER BY signal_id LIMIT 20").fetchall()
             for sid,message in pending:
                 send(message)
@@ -185,7 +282,7 @@ def monitor():
             with connect() as con:
                 pending = con.execute('SELECT id,symbol,ts,entry,side FROM signals WHERE ts > ? AND NOT EXISTS (SELECT 1 FROM results WHERE signal_id=signals.id AND minutes=15)', (time.time()-7200,)).fetchall()
                 if pending:
-                    prices = {r['symbol']: r for r in market('/fapi/v2/ticker/price')}
+                    prices = {r['symbol']: r for r in cached_market('/fapi/v2/ticker/price', 15)}
                     now = time.time()
                     for sid, symbol, stamp, entry, side in pending:
                         item = prices.get(symbol)
@@ -209,7 +306,7 @@ def monitor():
                 track_diagnostics()
             except Exception as exc:
                 print('Outcome error:', error_detail(exc), flush=True)
-        time.sleep(30)
+        time.sleep(60)
 
 def pairing():
     code = os.getenv('PAIRING_CODE', '')
@@ -231,12 +328,12 @@ def pairing():
         time.sleep(3)
 
 def scan_symbol(symbol, now_ms):
-    raw = market('/fapi/v1/klines', symbol=symbol, interval='1m', limit=480)
+    raw = market('/fapi/v1/klines', symbol=symbol, interval='1m', endTime=now_ms//300000*300000-1, limit=480)
     result = candidate(raw, now_ms)
     if result:
         print('Candidate:', symbol, result['side'], 'method:', result['method'], flush=True)
     if result and enabled('HTF_FILTER'):
-        hourly = market('/fapi/v1/klines', symbol=symbol, interval='1h', limit=100)
+        hourly = cached_market('/fapi/v1/klines', 240, symbol=symbol, interval='1h', limit=99, endTime=now_ms//3600000*3600000-1)
         hourly_side = trend_direction(hourly, now_ms, 3600000)
         if hourly_side != result['side']:
             print('Rejected:', symbol, result['side'], 'filter: HTF_1H', 'trend:', hourly_side or 'NEUTRAL', flush=True)
@@ -251,10 +348,11 @@ def main():
         raise RuntimeError('Missing TELEGRAM_TOKEN')
     init_db()
     print('Signal engine:', os.getenv('SIGNAL_ENGINE','PULLBACK'), 'max risk %:', os.getenv('MAX_RISK_PCT','1.5'), flush=True)
-    print('Diagnostics V4.0 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','SQUEEZE_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
-    send('ALPER Radar V4.0 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
+    print('Diagnostics V4.1 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','SQUEEZE_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
+    send('ALPER Radar V4.1 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
     threading.Thread(target=monitor, daemon=True).start()
     while True:
+        wait_for_close()
         start = time.monotonic()
         schedule_ms = int(time.time()*1000)
         with reasons_lock:
@@ -270,16 +368,19 @@ def main():
                 btc = market('/fapi/v1/klines', symbol='BTCUSDT', interval='15m', limit=100)
                 btc_side = trend_direction(btc, now_ms, 900000)
             print('BTC 15m direction:', (btc_side or 'NEUTRAL') if enabled('BTC_FILTER') else 'FILTER_OFF', 'SHORT enabled:', enabled('ENABLE_SHORT'), flush=True)
-            info = market('/fapi/v1/exchangeInfo')
+            info = cached_market('/fapi/v1/exchangeInfo', 3600)
             all_symbols = {s['symbol'] for s in info['symbols'] if s['status']=='TRADING' and s['contractType']=='PERPETUAL' and s['quoteAsset']=='USDT'}
             tickers = market('/fapi/v1/ticker/24hr')
             liquid = [t['symbol'] for t in tickers if t['symbol'] in all_symbols and float(t['quoteVolume']) >= float(os.getenv('MIN_VOLUME_USDT', '20000000'))]
             changes = {t['symbol']: abs(float(t['priceChangePercent'])) for t in tickers}
             eligible = [symbol for symbol in liquid if changes.get(symbol,0) <= float(os.getenv('MAX_24H_CHANGE_PCT','15'))]
             print('Active:', len(all_symbols), 'liquid:', len(liquid), 'within 24h move cap:', len(eligible), flush=True)
+            eligible.sort()
+            batch = select_scan_batch(eligible)
+            print('Rotating scan batch:', len(batch), 'of', len(eligible), flush=True)
             errors, found = 0, 0
-            with cf.ThreadPoolExecutor(max_workers=4) as pool:
-                futures = [pool.submit(scan_symbol, s, now_ms) for s in eligible]
+            with cf.ThreadPoolExecutor(max_workers=1) as pool:
+                futures = [pool.submit(scan_symbol, s, now_ms) for s in batch]
                 for future in cf.as_completed(futures):
                     try:
                         symbol, result = future.result()
@@ -332,6 +433,7 @@ def main():
                         errors += 1
                         print('Symbol error:', error_detail(exc), flush=True)
             print('Candidate rejections:', dict(scan_reasons), flush=True)
+            health(f'Tarama tamamlandı: {len(batch)}/{len(eligible)} uygun parite dönüşümlü taranıyor; bu tur {found} aday, {errors} hata. Başarı henüz doğrulanmadı.')
             print('Scan seconds:', round(time.monotonic()-start), 'alerts:', found, 'errors:', errors, flush=True)
         except Exception as exc:
             print('Scan unavailable:', error_detail(exc), flush=True)
@@ -353,7 +455,7 @@ def self_test():
         DB = str(Path(directory)/'test.sqlite3')
         init_db()
         with connect() as con:
-            con.execute('INSERT INTO signals(symbol,ts,entry,stop,target,score,candle) VALUES (?,?,?,?,?,?,?)', ('TEST', 1, 100, 99, 102, 90, 1))
+            con.execute('INSERT INTO signals(symbol,ts,entry,stop,target,score,candle) VALUES (?,?,?,?,?,?,?)', ('TEST', time.time(), 100, 99, 102, 90, 1))
             con.execute('INSERT INTO results VALUES (1,5,301,101,1,.85)')
             con.execute('INSERT OR IGNORE INTO results VALUES (1,5,302,102,2,1.85)')
             assert con.execute('SELECT count(*) FROM results').fetchone()[0] == 1
@@ -504,6 +606,11 @@ def pullback_candidate(raw, now_ms):
     atr = st.mean(max(a[i][2]-a[i][3],abs(a[i][2]-a[i-1][4]),abs(a[i][3]-a[i-1][4])) for i in range(len(a)-14,len(a)))
     if atr<=0 or closes[-1]<=0:
         return reject_candidate('INVALID_ATR')
+    # Directional efficiency avoids some choppy paths; heuristic, not a win-rate claim.
+    path = sum(abs(y-x) for x,y in zip(closes[-13:-1], closes[-12:]))
+    efficiency = abs(closes[-1]-closes[-13])/max(path, 1e-12)
+    if efficiency < float(os.getenv('MIN_TREND_EFFICIENCY', '0.25')):
+        return reject_candidate('CHOPPY_PATH')
     last = a[-1]
     volume = last[5]/max(st.mean(r[5] for r in a[-21:-1]),1e-12)
     location = (last[4]-last[3])/max(last[2]-last[3],1e-12)
@@ -633,10 +740,10 @@ def barrier_outcome(raw,stamp,stop,target,side,now_ms):
 def track_outcomes():
     with connect() as con:
         pending=con.execute('SELECT id,symbol,ts,stop,target,side FROM signals WHERE NOT EXISTS (SELECT 1 FROM outcomes WHERE signal_id=signals.id) ORDER BY ts LIMIT 30').fetchall()
-    now_ms=int(market('/fapi/v1/time')['serverTime']) if pending else int(time.time()*1000)
+    now_ms=int(cached_market('/fapi/v1/time', 5)['serverTime']) if pending else int(time.time()*1000)
     for sid,symbol,stamp,stop,target,side in pending:
         start=int(stamp*1000)//60000*60000
-        raw=market('/fapi/v1/klines',symbol=symbol,interval='1m',startTime=start,endTime=min(now_ms,start+1020000),limit=20)
+        raw=cached_market('/fapi/v1/klines', 55, symbol=symbol,interval='1m',startTime=start,endTime=min(now_ms//60000*60000-1,start+1020000),limit=20)
         outcome=barrier_outcome(raw,stamp,stop,target,side,now_ms)
         if outcome:
             with connect() as con:
@@ -696,7 +803,7 @@ def track_diagnostics():
             WHERE s.ts>? AND NOT EXISTS
             (SELECT 1 FROM diagnostics d WHERE d.signal_id=s.id)
             ORDER BY s.ts LIMIT 30""", (time.time()-7200,)).fetchall()
-    now_ms = int(market('/fapi/v1/time')['serverTime']) if pending else int(time.time()*1000)
+    now_ms = int(cached_market('/fapi/v1/time', 5)['serverTime']) if pending else int(time.time()*1000)
     for sid,symbol,stamp,entry,target,side in pending:
         start = int(stamp*1000)//60000*60000
         if now_ms < int(stamp*1000)+960000:
@@ -834,6 +941,7 @@ def run_backtest_cli():
             summaries[engine][segment]={'count':len(selected),'statuses':dict(Counter(t['status'] for t in selected)),
                 'positive_net_fraction':sum(x>0 for x in returns)/len(returns) if returns else None,
                 'mean_net_pct':st.mean(returns) if returns else None,
+                'profit_factor':sum(x for x in returns if x>0)/abs(sum(x for x in returns if x<0)) if any(x<0 for x in returns) else None,
                 'sum_net_pct_points':sum(returns),'drawdown_pct_points_equal_notional':drawdown}
     report={'limitations':['No measured performance until actual historical data is supplied.',
         'OI, funding, historical liquidity and 24h movement caps are NOT replayed; selected symbols may have selection bias.',
@@ -847,8 +955,75 @@ def run_backtest_cli():
     print(output)
 
 
+base_self_test = self_test
+
+def self_test():
+    base_self_test()
+    from unittest.mock import patch
+    from email.message import Message
+    global scan_offset, pause_until, next_call, rate_failures, last_rate_failure
+    saved = (scan_offset, pause_until, next_call, rate_failures, last_rate_failure, list(weight_events))
+    try:
+        assert endpoint_weight(BASE+'/fapi/v1/klines', {'limit':480}) == 2
+        assert endpoint_weight(BASE+'/fapi/v1/ticker/24hr', {}) == 40
+        scan_offset=0
+        with patch.dict(os.environ, {'MAX_SYMBOLS_PER_SCAN':'24'}):
+            seen=set()
+            universe=[str(i) for i in range(73)]
+            for _ in range(4):
+                batch=select_scan_batch(universe)
+                assert len(batch)==24
+                seen.update(batch)
+            assert seen==set(universe)
+        pause_until=next_call=0
+        weight_events.clear()
+        headers=Message(); headers['Retry-After']='7200'
+        failure=urllib.error.HTTPError(BASE,429,'rate limited',headers,None)
+        with patch.object(urllib.request,'urlopen',side_effect=failure) as network, patch.dict(globals(),{'health':lambda *a,**k:None}):
+            try:
+                request(BASE+'/fapi/v1/time',market=True)
+            except HTTPFailure as exc:
+                assert exc.status==429
+            else:
+                raise AssertionError('Missing 429 handling')
+            assert pause_until-time.monotonic()>7190
+            try:
+                request(BASE+'/fapi/v1/time',market=True)
+            except MarketPaused:
+                pass
+            else:
+                raise AssertionError('Missing cooldown')
+            assert network.call_count==1
+        raw=[[i*60000,100,101,99,100,1,(i+1)*60000-1,100] for i in range(480)]
+        future=raw+[[480*60000,100,100000,0,99999,1,481*60000-1,100]]
+        assert aggregate(raw,5,480*60000+5000)==aggregate(future,5,480*60000+5000)
+        setup={'side':'LONG','atr':1,'close':100,'method':'PULLBACK','structure_stop':99}
+        bars=[[i*60000,100,102,98,100,1,(i+1)*60000-1,100] for i in range(15)]
+        trade=replay_trade(bars,0,setup)
+        assert trade['status']=='AMBIGUOUS_STOP_ASSUMED' and trade['net_pct']<0
+        assert replay_trade(bars[:-1],0,setup) is None
+        print('PASS: weighted traffic, rotation, Retry-After, shared cooldown, future-bar exclusion, conservative replay and missing-data rejection.')
+    finally:
+        scan_offset,pause_until,next_call,rate_failures,last_rate_failure,events=saved
+        weight_events.clear(); weight_events.extend(events)
+
+def print_stats():
+    init_db()
+    with connect() as con:
+        counts = dict(con.execute('SELECT status,count(*) FROM outcomes GROUP BY status'))
+        closed = counts.get('TARGET',0) + counts.get('STOP',0)
+        returns = [r[0] for r in con.execute('SELECT net_pct FROM results WHERE minutes=15')]
+        report = {'barrier_outcomes':counts, 'target_fraction_among_unambiguous_target_stop':counts.get('TARGET',0)/closed if closed else None,
+                  'unambiguous_target_stop_count':closed, 'fifteen_minute_observations':len(returns),
+                  'positive_net_15m_fraction':sum(x>0 for x in returns)/len(returns) if returns else None,
+                  'mean_net_15m_pct':st.mean(returns) if returns else None,
+                  'limitations':'Target/stop fraction excludes timeout, ambiguity and gaps. 15m returns are price observations with assumed costs, not strategy fills. Legacy signals included; use separate DATA_DIR for version comparisons.'}
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
 if __name__ == '__main__':
-    if '--backtest' in sys.argv:
+    if '--stats' in sys.argv:
+        print_stats()
+    elif '--backtest' in sys.argv:
         run_backtest_cli()
     elif '--self-test' in sys.argv:
         self_test()
