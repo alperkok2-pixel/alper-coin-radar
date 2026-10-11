@@ -25,6 +25,7 @@ Costs: COST_BPS is assumed round-trip commission + slippage (default 15 bps).
 Local check: python alper_radar.py --self-test
 """
 import concurrent.futures as cf
+from collections import Counter
 import datetime as dt
 import json
 import os
@@ -49,6 +50,21 @@ pause_until = 0.0
 market_io = threading.Lock()
 rate_failures = 0
 last_rate_failure = 0.0
+scan_reasons = Counter()
+reasons_lock = threading.Lock()
+
+def reject_candidate(reason):
+    with reasons_lock:
+        scan_reasons[reason] += 1
+    return None
+
+def btc_allows(side, btc_side):
+    # Neutral BTC permits the candidate's own 5m/15m/1h trend checks.
+    return not enabled("BTC_FILTER") or btc_side is None or side == btc_side
+
+def next_scan_delay(server_ms, elapsed):
+    # Run shortly after the next 5m close; never overlap completed scans.
+    return max(5.0, 300 - (server_ms / 1000 % 300) + 5 - elapsed)
 
 class HTTPFailure(RuntimeError):
     def __init__(self, source, status):
@@ -222,16 +238,20 @@ def main():
     if not TOKEN:
         raise RuntimeError('Missing TELEGRAM_TOKEN')
     init_db()
-    print('Diagnostics V2.4 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
-    send('ALPER Radar V2.4 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
+    print('Diagnostics V2.5 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
+    send('ALPER Radar V2.5 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
     threading.Thread(target=monitor, daemon=True).start()
     while True:
         start = time.monotonic()
+        schedule_ms = int(time.time()*1000)
+        with reasons_lock:
+            scan_reasons.clear()
         if start < pause_until:
             time.sleep(min(30, pause_until-start))
             continue
         try:
             now_ms = int(market('/fapi/v1/time')['serverTime'])
+            schedule_ms = now_ms
             btc_side = None
             if enabled('BTC_FILTER'):
                 btc = market('/fapi/v1/klines', symbol='BTCUSDT', interval='15m', limit=100)
@@ -250,7 +270,7 @@ def main():
                         symbol, result = future.result()
                         if not result:
                             continue
-                        if enabled('BTC_FILTER') and result['side'] != btc_side:
+                        if not btc_allows(result['side'], btc_side):
                             print('Rejected:', symbol, result['side'], 'filter: BTC', 'trend:', btc_side or 'NEUTRAL', flush=True)
                             continue
                         if not derivatives_filter(symbol, result):
@@ -293,10 +313,11 @@ def main():
                     except Exception as exc:
                         errors += 1
                         print('Symbol error:', error_detail(exc), flush=True)
+            print('Candidate rejections:', dict(scan_reasons), flush=True)
             print('Scan seconds:', round(time.monotonic()-start), 'alerts:', found, 'errors:', errors, flush=True)
         except Exception as exc:
             print('Scan unavailable:', error_detail(exc), flush=True)
-        time.sleep(max(5, max(180, float(os.getenv("SCAN_INTERVAL_SECONDS", "180")))-(time.monotonic()-start)))
+        time.sleep(next_scan_delay(schedule_ms, time.monotonic()-start))
 
 def self_test():
     raw = [[i*60000, '10', '12', '9', '11', '1', (i+1)*60000-1, '100'] for i in range(480)]
@@ -358,17 +379,20 @@ def retest_setup(a, atr, direction):
 
 def candidate(raw, now_ms):
     a, b = aggregate(raw,5,now_ms), aggregate(raw,15,now_ms)
-    if len(a)<30 or len(b)<25 or now_ms-(a[-1][0]+300000)>90000:
-        return None
+    if len(a)<30 or len(b)<25:
+        return reject_candidate('INSUFFICIENT_BARS')
+    if now_ms-(a[-1][0]+300000)>90000:
+        return reject_candidate('CANDLE_WINDOW')
     if any(y[0]-x[0]!=300000 for x,y in zip(a,a[1:])):
-        return None
+        return reject_candidate('DATA_GAP_5M')
     if any(y[0]-x[0]!=900000 for x,y in zip(b,b[1:])):
-        return None
+        return reject_candidate('DATA_GAP_15M')
     closes,big=[r[4] for r in a],[r[4] for r in b]
     last,prev=a[-1],a[-21:-1]
     atr=st.mean(max(a[i][2]-a[i][3],abs(a[i][2]-a[i-1][4]),abs(a[i][3]-a[i-1][4])) for i in range(len(a)-14,len(a)))
     if atr<=0:
-        return None
+        return reject_candidate("INVALID_ATR")
+    failures = []
     for side,d in [('LONG',1),('SHORT',-1)]:
         if side=='SHORT' and not enabled('ENABLE_SHORT'):
             continue
@@ -386,9 +410,19 @@ def candidate(raw, now_ms):
         strong=location>=.7 if d==1 else location<=.3
         extension=d*(last[4]-ema(closes,21))/atr
         score=25*trend+25*setup+20*(volume>=1.5)+20*momentum+10*strong
+        if not trend:
+            failures.append(side+'_TREND_15M')
+        elif not setup:
+            failures.append(side+'_RETEST' if enabled('RETEST_FILTER') else side+'_BREAKOUT_VOLUME')
+        elif not momentum:
+            failures.append(side+'_MOMENTUM_5M')
+        elif not 0<extension<3:
+            failures.append(side+'_EXTENSION')
+        elif score<80:
+            failures.append(side+'_SCORE')
         if trend and setup and momentum and score>=80 and 0<extension<3:
             return dict(side=side,score=score,atr=atr,close=last[4],candle=last[0],volume=volume)
-    return None
+    return reject_candidate('|'.join(failures) or 'NO_SETUP')
 
 def derivatives_filter(symbol, result):
     d=1 if result['side']=='LONG' else -1
