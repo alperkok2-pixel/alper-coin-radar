@@ -238,8 +238,8 @@ def main():
     if not TOKEN:
         raise RuntimeError('Missing TELEGRAM_TOKEN')
     init_db()
-    print('Diagnostics V2.5 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
-    send('ALPER Radar V2.5 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
+    print('Diagnostics V3.0 | filters:', {name: enabled(name) for name in ('ENABLE_SHORT','BTC_FILTER','HTF_FILTER','RETEST_FILTER','SQUEEZE_FILTER','FUNDING_FILTER','OI_FILTER')}, flush=True)
+    send('ALPER Radar V3.0 started — ' + ('DENEME' if PAPER else 'ADAY BİLDİRİMLERİ') + '. Otomatik işlem yok; başarı oranı henüz ölçülmedi.')
     threading.Thread(target=monitor, daemon=True).start()
     while True:
         start = time.monotonic()
@@ -299,10 +299,10 @@ def main():
                             stop, target = entry-direction*risk, entry+direction*1.5*risk
                             if min(stop, target) <= 0:
                                 continue
-                            con.execute('INSERT INTO signals(symbol,ts,entry,stop,target,score,candle,side) VALUES (?,?,?,?,?,?,?,?)',
-                                        (symbol, stamp, entry, stop, target, result['score'], result['candle'], result['side']))
+                            con.execute('INSERT INTO signals(symbol,ts,entry,stop,target,score,candle,side,method) VALUES (?,?,?,?,?,?,?,?,?)',
+                                        (symbol, stamp, entry, stop, target, result['score'], result['candle'], result['side'], result['method']))
                         clock = dt.datetime.fromtimestamp(stamp, dt.timezone(dt.timedelta(hours=3))).strftime('%H:%M:%S')
-                        send(f"{'DENEME | ' if PAPER else ''}{result['side']} ADAYI: {symbol}\nSaat (TR): {clock}\nKural puanı: {result['score']}/100 (olasılık değil)\nReferans fiyat: {entry:.8g}\nStop referansı: {stop:.8g}\nHedef referansı: {target:.8g}\nHacim: {result['volume']:.2f}x\nOI değişimi (15dk): {result.get('oi_text', 'filtre kapalı')}\nFonlama: {result.get('funding_text', 'filtre kapalı')}\nİzleme: sonraki 5 ve 15 dk. Seviyeler otomatik emir değildir.")
+                        send(f"{'DENEME | ' if PAPER else ''}{result['side']} ADAYI: {symbol}\nYöntem: {METHOD_LABELS[result['method']]}\nSaat (TR): {clock}\nKural puanı: {result['score']}/100 (olasılık değil)\nReferans fiyat: {entry:.8g}\nStop referansı: {stop:.8g}\nHedef referansı: {target:.8g}\nHacim: {result['volume']:.2f}x\nOI değişimi (15dk): {result.get('oi_text', 'filtre kapalı')}\nFonlama: {result.get('funding_text', 'filtre kapalı')}\nİzleme: sonraki 5 ve 15 dk. Seviyeler otomatik emir değildir.")
                         print('Alert sent:', symbol, result['side'], flush=True)
                         found += 1
                     except MarketPaused:
@@ -341,6 +341,7 @@ def self_test():
     print('PASS: candle alignment, partial/gapped bars, EMA, neutral-market rejection.')
 
 
+# Independent signal paths: RETEST_FILTER and SQUEEZE_FILTER (default ON).
 # All default ON: BTC_FILTER, HTF_FILTER, RETEST_FILTER, FUNDING_FILTER,
 # OI_FILTER, ENABLE_SHORT, RESULT_TRACKING. Set any to 0 to disable.
 # Thresholds are unvalidated heuristics; more filters do not guarantee accuracy.
@@ -377,6 +378,28 @@ def retest_setup(a, atr, direction):
             return ratio
     return None
 
+METHOD_LABELS = {'RETEST': 'Geri test', 'SQUEEZE_BREAKOUT': 'Sıkışma–kırılım', 'LEGACY': 'Önceki sürüm'}
+
+def squeeze_breakout(a, direction):
+    # Compare only pre-breakout candles: 12 recent ranges vs 24 earlier ranges.
+    if len(a) < 37:
+        return None
+    last, recent, baseline = a[-1], a[-13:-1], a[-37:-13]
+    base_range = st.mean(r[2]-r[3] for r in baseline)
+    recent_range = st.mean(r[2]-r[3] for r in recent)
+    if base_range <= 0 or recent_range > .8*base_range:
+        return None
+    upper, lower = max(r[2] for r in recent), min(r[3] for r in recent)
+    if upper-lower > 3*base_range:
+        return None
+    ratio = last[5]/max(st.mean(r[5] for r in a[-21:-1]),1e-12)
+    level = upper if direction == 1 else lower
+    location = (last[4]-last[3])/max(last[2]-last[3],1e-12)
+    strong = location >= .7 if direction == 1 else location <= .3
+    if direction*(last[4]-level)>0 and ratio>=1.5 and strong and direction*(last[4]-last[1])>0:
+        return ratio
+    return None
+
 def candidate(raw, now_ms):
     a, b = aggregate(raw,5,now_ms), aggregate(raw,15,now_ms)
     if len(a)<30 or len(b)<25:
@@ -400,12 +423,14 @@ def candidate(raw, now_ms):
         momentum=d*(closes[-1]-ema(closes,9))>0 and d*(ema(closes,9)-ema(closes,21))>0
         volume=last[5]/max(st.mean(r[5] for r in prev),1e-12)
         breakout=last[4]>max(r[2] for r in prev) if d==1 else last[4]<min(r[3] for r in prev)
-        setup=breakout and volume>=1.5
-        if enabled('RETEST_FILTER'):
-            retest_volume=retest_setup(a,atr,d)
-            setup=retest_volume is not None
-            if setup:
-                volume=retest_volume
+        retest_volume = retest_setup(a,atr,d) if enabled('RETEST_FILTER') else None
+        squeeze_volume = squeeze_breakout(a,d) if enabled('SQUEEZE_FILTER') else None
+        method = 'RETEST' if retest_volume is not None else ('SQUEEZE_BREAKOUT' if squeeze_volume is not None else None)
+        setup = method is not None
+        if method == 'RETEST':
+            volume = retest_volume
+        elif method == 'SQUEEZE_BREAKOUT':
+            volume = squeeze_volume
         location=(last[4]-last[3])/max(last[2]-last[3],1e-12)
         strong=location>=.7 if d==1 else location<=.3
         extension=d*(last[4]-ema(closes,21))/atr
@@ -413,7 +438,7 @@ def candidate(raw, now_ms):
         if not trend:
             failures.append(side+'_TREND_15M')
         elif not setup:
-            failures.append(side+'_RETEST' if enabled('RETEST_FILTER') else side+'_BREAKOUT_VOLUME')
+            failures.append(side+'_NO_RETEST_OR_SQUEEZE')
         elif not momentum:
             failures.append(side+'_MOMENTUM_5M')
         elif not 0<extension<3:
@@ -421,7 +446,7 @@ def candidate(raw, now_ms):
         elif score<80:
             failures.append(side+'_SCORE')
         if trend and setup and momentum and score>=80 and 0<extension<3:
-            return dict(side=side,score=score,atr=atr,close=last[4],candle=last[0],volume=volume)
+            return dict(side=side,score=score,atr=atr,close=last[4],candle=last[0],volume=volume,method=method)
     return reject_candidate('|'.join(failures) or 'NO_SETUP')
 
 def derivatives_filter(symbol, result):
@@ -463,6 +488,8 @@ def init_db():
         columns={r[1] for r in con.execute('PRAGMA table_info(signals)')}
         if 'side' not in columns:
             con.execute("ALTER TABLE signals ADD COLUMN side TEXT NOT NULL DEFAULT 'LONG'")
+        if 'method' not in columns:
+            con.execute("ALTER TABLE signals ADD COLUMN method TEXT NOT NULL DEFAULT 'LEGACY'")
         con.execute('CREATE TABLE IF NOT EXISTS diagnostics (signal_id INTEGER PRIMARY KEY, approach_pct REAL, adverse_pct REAL, coverage TEXT, notified INTEGER DEFAULT 0)')
         con.execute('CREATE TABLE IF NOT EXISTS outcomes (signal_id INTEGER PRIMARY KEY, status TEXT, observed REAL, reference_price REAL, notified INTEGER DEFAULT 0)')
 
@@ -503,9 +530,9 @@ def track_outcomes():
                 con.execute('INSERT OR IGNORE INTO outcomes(signal_id,status,observed,reference_price) VALUES (?,?,?,?)',(sid,*outcome))
     labels={'TARGET':'Hedef görüldü','STOP':'Stop görüldü','AMBIGUOUS':'Mum içi sıra/zaman belirsiz','TIMEOUT':'15 dk içinde hedef/stop görülmedi','DATA_GAP':'Veri eksik; değerlendirilemedi'}
     with connect() as con:
-        notices=con.execute('SELECT o.signal_id,s.symbol,s.side,o.status FROM outcomes o JOIN signals s ON s.id=o.signal_id WHERE o.notified=0').fetchall()
-        for sid,symbol,side,status in notices:
-            send(f'DENEME SONUCU | {symbol} {side}: {labels[status]}. 1dk mum incelemesi; gerçek emir gerçekleşmesi değildir.')
+        notices=con.execute('SELECT o.signal_id,s.symbol,s.side,o.status,s.method FROM outcomes o JOIN signals s ON s.id=o.signal_id WHERE o.notified=0').fetchall()
+        for sid,symbol,side,status,method in notices:
+            send(f'DENEME SONUCU | {symbol} {side} | {METHOD_LABELS.get(method,method)}: {labels[status]}. 1dk mum incelemesi; gerçek emir gerçekleşmesi değildir.')
             con.execute('UPDATE outcomes SET notified=1 WHERE signal_id=?',(sid,))
 
 
@@ -535,12 +562,12 @@ def excursion_metrics(raw, stamp, entry, target, side, now_ms):
     return favorable / distance * 100, adverse / entry * 100, 'INTERIOR_1M'
 
 
-def diagnostic_message(symbol, side, approach, adverse, coverage, gross, net, delay):
+def diagnostic_message(symbol, side, approach, adverse, coverage, gross, net, delay, method):
     movement = (f'Hedef mesafesine yaklaşma: %{approach:.1f}\n'
                 f'En büyük ters hareket: %{adverse:.2f}\n'
                 'Yaklaşma ölçümü: sınır dakikaları hariç tam 1dk mumlar; '
                 'hedef/stop sonrasında da 15dk pencere izlenir.') if coverage == 'INTERIOR_1M' else 'Yaklaşma ölçümü: veri eksik veya seviyeler geçersiz.'
-    return (f'DENEME | 15 DK ANALİZİ | {symbol} {side}\n{movement}\n'
+    return (f'DENEME | 15 DK ANALİZİ | {symbol} {side}\nYöntem: {METHOD_LABELS.get(method,method)}\n{movement}\n'
             f'15dk sonu brüt: %{gross:+.2f}\n'
             f'Varsayılan maliyet sonrası: %{net:+.2f}\n'
             f'Ölçüm gecikmesi: {delay:.0f} saniye\n'
@@ -569,7 +596,7 @@ def track_diagnostics():
                         (sid,approach,adverse,coverage))
     with connect() as con:
         notices = con.execute("""SELECT d.signal_id,s.symbol,s.side,d.approach_pct,
-            d.adverse_pct,d.coverage,r.gross_pct,r.net_pct,r.observed-s.ts-900
+            d.adverse_pct,d.coverage,r.gross_pct,r.net_pct,r.observed-s.ts-900,s.method
             FROM diagnostics d JOIN signals s ON s.id=d.signal_id
             JOIN results r ON r.signal_id=s.id AND r.minutes=15
             WHERE d.notified=0""").fetchall()
