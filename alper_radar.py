@@ -1,4 +1,4 @@
-"""ALPER Radar V6.2 — Binance USD-M futures PAPER signal radar.
+"""ALPER Radar V6.3 — Binance USD-M futures PAPER signal radar.
 Python 3.11+; standard library only. NEVER submits orders.
 Start: python -u alper_radar.py   Test: python alper_radar.py --self-test
 Telegram secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (Render environment).
@@ -26,6 +26,7 @@ CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TARGET_PCT = float(os.getenv("MIN_TARGET_PCT", "5"))
 VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.3"))
 DETAIL_BATCH = max(1, min(30, int(os.getenv("DETAIL_BATCH", "12"))))
+MONITOR_BATCH = max(1, min(12, int(os.getenv("MONITOR_BATCH", "3"))))
 HOT_POOL = max(DETAIL_BATCH, min(120, int(os.getenv("HOT_POOL", "60"))))
 CANDIDATE_REFRESH_SECONDS = max(60, int(os.getenv("CANDIDATE_REFRESH_SECONDS", "60")))
 MAX_SIGNAL_AGE_SECONDS = max(60, int(os.getenv("MAX_SIGNAL_AGE_SECONDS", "600")))
@@ -68,7 +69,7 @@ def fetch(base, path, params=None, attempts=3):
         if base == BASE:
             _last_api_call = time.monotonic()
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": "ALPER-Radar-Paper/6.2"})
+            request = urllib.request.Request(url, headers={"User-Agent": "ALPER-Radar-Paper/6.3"})
             with urllib.request.urlopen(request, timeout=18) as response:
                 if base == BASE:
                     raw_weight = response.headers.get("X-MBX-USED-WEIGHT-1M")
@@ -344,7 +345,14 @@ def universe():
 def monitor(con):
     # Track by candle highs/lows after signal bar, never unfinished candles.
     active = con.execute("SELECT id,symbol,side,entry,target,stop,bar_close_ms,opened FROM trades WHERE status='OPEN'").fetchall()
-    # Monitoring remains independent of universe batching.
+    # Bound monitoring load so a backlog cannot block scanning indefinitely.
+    if active:
+        rec = con.execute("SELECT value FROM radar_state WHERE key='monitor_cursor'").fetchone()
+        offset = int(rec[0]) % len(active) if rec else 0
+        active = (active[offset:] + active[:offset])[:MONITOR_BATCH]
+        con.execute("INSERT OR REPLACE INTO radar_state(key,value) VALUES('monitor_cursor',?)", (str((offset+len(active)) % max(1, len(con.execute("SELECT 1 FROM trades WHERE status='OPEN'").fetchall()))),))
+        con.commit()
+    log(f"Monitoring paper signals: {len(active)} selected")
     for trade_id, symbol, side, entry, target, stop, bar_ms, opened in active:
         try:
             now = int(time.time())
@@ -388,7 +396,9 @@ def monitor(con):
 
 def scan(con, symbols, cache=None):
     sent = 0
-    for symbol in symbols:
+    log(f"Detailed scan BEGIN: {len(symbols)} symbols")
+    for i, symbol in enumerate(symbols, 1):
+        log(f"Detailed progress: {i}/{len(symbols)} {symbol}")
         try:
             s5 = candles(symbol, "5m")
             if cache is None:
@@ -411,7 +421,7 @@ def scan(con, symbols, cache=None):
                                     (symbol, side, found["close_ms"])).fetchone()
             if duplicate:
                 continue
-            msg = (f"🚨 ALPER Radar V6.2 | PAPER {side}\n{symbol}\n"
+            msg = (f"🚨 ALPER Radar V6.3 | PAPER {side}\n{symbol}\n"
                    f"Reference entry: {found['entry']:.9g}\n"
                    f"🎯 Target (+{TARGET_PCT:g}% price move): {found['target']:.9g}\n"
                    f"🛑 Stop ({found['stop_pct']:.2f}% price move): {found['stop']:.9g}\n"
@@ -534,8 +544,8 @@ def main():
     if not (0.2 <= TARGET_PCT <= 30 and 0.3 <= STOP_LIMIT <= 5):
         raise ValueError("Check MIN_TARGET_PCT and MAX_STOP_PCT")
     con = db_connect()
-    log("ALPER Radar V6.2 PAPER started; order execution DISABLED")
-    notify(f"✅ ALPER Radar V6.2 started (PAPER only)\nMinimum target {TARGET_PCT:g}% (price, not leverage)\nAll USDT perpetuals bulk-screened; detailed analysis is prioritized and rotating")
+    log("ALPER Radar V6.3 PAPER started; order execution DISABLED")
+    notify(f"✅ ALPER Radar V6.3 started (PAPER only)\nMinimum target {TARGET_PCT:g}% (price, not leverage)\nAll USDT perpetuals bulk-screened; detailed analysis is prioritized and rotating")
     cycle = 0
     symbols, hot = [], []
     cache = {}
@@ -561,7 +571,9 @@ def main():
                 hot = rank_market(ticker, set(symbols))[:HOT_POOL]
                 last_screen = time.monotonic()
                 log(f"Bulk screen: {len(symbols)} listed; {len(hot)} hot candidates")
-            batch, cursor = pick_batch(symbols, hot, cursor, cycle)
+            batch, proposed_cursor = pick_batch(symbols, hot, cursor, cycle)
+            log(f"Selected detailed batch: {len(batch)} coins")
+            cursor = proposed_cursor
             con.execute("INSERT OR REPLACE INTO radar_state(key,value) VALUES('cursor',?)", (str(cursor),))
             con.commit()
             # A limited number of active trackers are checked each cycle.
@@ -574,7 +586,7 @@ def main():
                 open_count = con.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
                 stats = con.execute("SELECT strategy,status,COUNT(*) FROM trades GROUP BY strategy,status").fetchall()
                 overview = "; ".join(f"{a}:{b}={c}" for a,b,c in stats)[:600] or "no trades yet"
-                notify(f"💚 ALPER Radar V6.2 health | {len(symbols)} bulk-screened | {len(batch)} detailed | {found} signals | {open_count} open paper signals\n{overview}")
+                notify(f"💚 ALPER Radar V6.3 health | {len(symbols)} bulk-screened | {len(batch)} detailed | {found} signals | {open_count} open paper signals\n{overview}")
             cycle += 1
         except KeyboardInterrupt:
             raise
