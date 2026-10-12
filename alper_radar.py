@@ -1,10 +1,11 @@
-"""ALPER Radar V4.2 + tracker: paper-only Binance USDT perpetual scanner.
+"""ALPER Radar V4.2 + High Target Filter + tracker: paper-only Binance USDT perpetual scanner.
 Python 3.11+, standard library only. No order execution.
 Render start: python -u alper_radar.py
 Environment: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (secrets), PAPER_MODE=1.
 Optional: MAX_SYMBOLS_PER_SCAN=20, MIN_VOLUME_USDT=20000000,
 SCAN_INTERVAL_SECONDS=300, REQUEST_INTERVAL_SECONDS=2.2,
-MIN_VOLUME_RATIO=1.0, MIN_SCORE=3, BTC_FILTER=0, HTF_FILTER=1,
+MIN_VOLUME_RATIO=1.5, MIN_SCORE=4, MIN_TARGET_PCT=1.0,
+MAX_RISK_PCT=1.5, BTC_FILTER=0, HTF_FILTER=1,
 MAX_24H_CHANGE_PCT=20, HEALTH_INTERVAL_SECONDS=1800.
 Run: python alper_radar.py --self-test
 """
@@ -242,6 +243,23 @@ def direction(rows, now_ms):
     return None
 
 
+def target_filter(entry, stop, target, side):
+    # All thresholds refer to unleveraged PRICE movements, not guaranteed profit.
+    if entry <= 0 or stop <= 0 or target <= 0:
+        return False, 'INVALID_LEVELS', 0.0, 0.0
+    sign = 1 if side == 'LONG' else -1
+    gain_pct = sign * (target - entry) / entry * 100
+    loss_pct = sign * (entry - stop) / entry * 100
+    if gain_pct <= 0 or loss_pct <= 0:
+        return False, 'INVALID_LEVELS', gain_pct, 0.0
+    rr = gain_pct / loss_pct
+    if gain_pct < envfloat('MIN_TARGET_PCT', 1.0):
+        return False, 'LOW_TARGET_PCT', gain_pct, rr
+    if rr < envfloat('MIN_REWARD_RISK', 1.5) - 1e-8:
+        return False, 'LOW_REWARD_RISK', gain_pct, rr
+    return True, 'OK', gain_pct, rr
+
+
 def evaluate(five, fifteen, hourly, now_ms):
     """Returns (candidate, reason). Only completed, contiguous bars are used."""
     a, b, h = (closed(x, now_ms) for x in (five, fifteen, hourly))
@@ -266,7 +284,7 @@ def evaluate(five, fifteen, hourly, now_ms):
         return None, 'INVALID_PRICE'
     avgvol = sum(v[-21:-1]) / 20
     volume_ratio = v[-1] / avgvol if avgvol > 0 else 0
-    if volume_ratio < envfloat('MIN_VOLUME_RATIO', 1.0):
+    if volume_ratio < envfloat('MIN_VOLUME_RATIO', 1.5):
         return None, 'LOW_VOLUME'
     e9, e21 = ema(c, 9), ema(c, 21)
     prev_high = max(float(r[2]) for r in a[-13:-1])
@@ -283,7 +301,7 @@ def evaluate(five, fifteen, hourly, now_ms):
     if not method:
         return None, 'NO_SETUP'
     score = int(trend5) + int(momentum) + int(volume_ratio >= 1.3) + int(trend1h == side)
-    if score < int(envfloat('MIN_SCORE', 3)):
+    if score < int(envfloat('MIN_SCORE', 4)):
         return None, 'LOW_SCORE'
     ranges = [max(float(r[2])-float(r[3]), abs(float(r[2])-float(a[i-1][4])),
                   abs(float(r[3])-float(a[i-1][4]))) for i, r in enumerate(a[-14:], len(a)-14)]
@@ -293,9 +311,13 @@ def evaluate(five, fifteen, hourly, now_ms):
     stop = close_price - sign * 1.2 * atr
     target = close_price + sign * 1.8 * atr
     risk_pct = abs(close_price - stop) / close_price * 100
-    if stop <= 0 or target <= 0 or not .15 <= risk_pct <= envfloat('MAX_RISK_PCT', 2.0):
+    if stop <= 0 or target <= 0 or not .15 <= risk_pct <= envfloat('MAX_RISK_PCT', 1.5):
         return None, 'RISK_DISTANCE'
-    return {'side': side, 'method': method, 'close': close_price, 'stop': stop,
+    accepted, target_reason, gain_pct, rr = target_filter(close_price, stop, target, side)
+    if not accepted:
+        return None, target_reason
+    return {'target_pct': gain_pct, 'reward_risk': rr,
+            'side': side, 'method': method, 'close': close_price, 'stop': stop,
             'target': target, 'risk_pct': risk_pct, 'score': score,
             'volume': volume_ratio, 'candle': int(last[0])}, 'OK'
 
@@ -344,6 +366,8 @@ def scan(con):
                        f'Hedef referansı: {result["target"]:.8g}\n'
                        f'Stop fiyat mesafesi: %{result["risk_pct"]:.2f}\n'
                        f'Hacim oranı: {result["volume"]:.2f}x\n'
+                       f'Teorik hedef hareketi: %{result["target_pct"]:.2f}\n'
+                       f'Risk/getiri: 1:{result["reward_risk"]:.2f}\n'
                        'Sinyal deneysel ve gecikmelidir. Referanslar emir değildir; başarı doğrulanmadı.')
             if send(message):
                 add_signal(con, symbol, result, int(time.time() * 1000))
@@ -402,11 +426,15 @@ def self_test():
     assert closed([[0,1,2,0,1,1,59999]], 60000)
     assert not closed([[0,1,2,0,1,1,59999]], 59999)
     assert track_minutes('BREAKOUT') == 30 and track_minutes('PULLBACK') == 60
-    print('PASS: EMA, empty data, closed candles, tracking windows')
+    assert target_filter(100, 99, 101.5, 'LONG')[0]
+    assert target_filter(100, 99, 100.5, 'LONG')[1] == 'LOW_TARGET_PCT'
+    assert target_filter(100, 101, 98.5, 'SHORT')[0]
+    assert target_filter(100, 101, 99.6, 'SHORT')[1] == 'LOW_TARGET_PCT'
+    assert target_filter(100, 102, 101.5, 'LONG')[1] == 'INVALID_LEVELS'
+    print('PASS: filters, EMA, closed candles, tracking windows')
 
 
 if __name__ == '__main__':
     if '--self-test' in sys.argv:
         self_test()
     else:
-        main()
