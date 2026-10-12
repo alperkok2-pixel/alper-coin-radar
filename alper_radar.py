@@ -1,10 +1,11 @@
-"""ALPER Radar V8.4 | PAPER ONLY, Binance USD-M USDT perpetuals.
+"""ALPER Radar V8.4 TREND | PAPER ONLY, Binance USD-M USDT perpetuals.
 Python 3.11+; pip install websocket-client==1.9.0
 Run: python -u alper_radar.py | Test: python alper_radar.py --self-test
 Environment: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, FOLLOW_COUNT=60,
 FOLLOW_REFRESH_SECONDS=60, RADAR_DB=/var/data/alper_radar.sqlite3 (persistent Render disk),
 MIN_24H_QUOTE=15000000. No orders, no exchange account keys.
-This is an experimental paper signal system, NOT a validated trading strategy.
+Experimental paper signal system, NOT a validated trading strategy.
+V8.4 TREND: require fresh 15m and 1h trend agreement for confirmations.
 """
 from __future__ import annotations
 import collections
@@ -58,7 +59,7 @@ def number(x, default=0.):
     except (TypeError, ValueError, OverflowError): return default
 
 def api(path):
-    req = urllib.request.Request(REST + path, headers={'User-Agent': 'ALPER-Paper-Radar/8.4'})
+    req = urllib.request.Request(REST + path, headers={'User-Agent': 'ALPER-Paper-Radar/8.4-trend'})
     with urllib.request.urlopen(req, timeout=20) as response: return json.load(response)
 
 def universe():
@@ -124,6 +125,11 @@ def analyze(trades, price, updated, at=None, mode='confirm'):
     return {'direction': direction, 'price': price, 'strength': strength,
             'burst': burst, 'flow': current, 'move': move, 'age_ms': at-updated}
 
+def trend_allows(direction, trend):
+    """Fail closed: no confirmation without both complete matching trends."""
+    return direction in ('LONG', 'SHORT') and all(
+        trend.get(frame) == direction for frame in ('15m', '1h'))
+
 class Database:
     def __init__(self, path=DB):
         self.lock = threading.RLock()
@@ -175,6 +181,8 @@ class Database:
 
     def confirmed_if_eligible(self, ts, sym, val, trend=None):
         p=val['price']; direction=val['direction']; islong=direction=='LONG'
+        # Gate again at the database entry point, not just the websocket caller.
+        if not trend_allows(direction, trend or {}): return None
         tp=p*(1.015 if islong else .985)
         sl=p*(.9925 if islong else 1.0075)
         with self.lock:
@@ -190,10 +198,11 @@ class Database:
             id_=cur.lastrowid
             self.con.execute("UPDATE watches SET status='CONFIRMED',resolved=? WHERE symbol=? AND direction=? AND status='WATCH' AND created>=?",
                              (ts,sym,direction,ts-10*60*1000))
-            msg=(f'✅ ALPER V8.4 | ONAYLI SANAL {direction}\n{sym} | giriş referansı: {p:.9g}\n'
+            msg=(f'✅ ALPER V8.4 TREND | ONAYLI SANAL {direction}\n{sym} | giriş referansı: {p:.9g}\n'
                  f'TP (+1.5%): {tp:.9g}\nSTOP (-0.75%): {sl:.9g}\n'
                  f'Akış baskısı %{val["strength"]*100:.0f}, ivme {val["burst"]:.1f}x | '
-                 f'fiyat hareketi %{val["move"]:.2f}\nKayıt #{id_} | işlem tavsiyesi değildir.')
+                 f'fiyat hareketi %{val["move"]:.2f}\n15m ve 1h trend onaylı\n'
+                 f'Kayıt #{id_} | işlem tavsiyesi değildir.')
             self._outbox(id_,'entry',msg,ts)
             self.con.commit()
             return id_,tp,sl,delay
@@ -287,7 +296,6 @@ class Radar:
             p.price=price;p.quote=quote;p.updated=ts
             if not p.history or ts-p.history[-1][0]>=1500:p.history.append((ts,price))
             self.last_market=now_ms()
-        # Existing miniTicker stream remains a secondary fallback for results.
         if settle:self.close_from_price(sym,price,ts,'miniTicker')
 
     def close_from_price(self,sym,price,ts,source):
@@ -320,7 +328,8 @@ class Radar:
                         LOG.warning('TREND unavailable %s %s: %s',sym,interval,exc)
                         break
                     STOP.wait(.5)
-                if readings:
+                # Only publish a complete snapshot: no partial/stale timeframe mixing.
+                if all(key in readings for key in ('5m','15m','1h')):
                     with self.lock:self.trend[sym]=(readings,now_ms())
             STOP.wait(20)
 
@@ -347,7 +356,9 @@ class Radar:
             LOG.info('WATCH %s %s recorded (Telegram muted)',sym,watch['direction'])
         confirmed=analyze(snapshot,price,updated,current,'confirm')
         if not confirmed:return
-        recorded=self.db.confirmed_if_eligible(current,sym,confirmed,self.trend_snapshot(sym))
+        trend=self.trend_snapshot(sym)
+        if not trend_allows(confirmed['direction'],trend):return
+        recorded=self.db.confirmed_if_eligible(current,sym,confirmed,trend)
         if recorded:
             id_,tp,sl,delay=recorded
             LOG.info('CONFIRMED %s %s #%d TP=%.9g STOP=%.9g delay_ms=%d',sym,confirmed['direction'],id_,tp,sl,delay)
@@ -503,6 +514,11 @@ class Radar:
 
 def self_test():
     import tempfile
+    assert trend_allows('LONG', {'15m':'LONG','1h':'LONG'})
+    assert trend_allows('SHORT', {'15m':'SHORT','1h':'SHORT'})
+    assert not trend_allows('LONG', {'15m':'LONG','1h':'SHORT'})
+    assert not trend_allows('SHORT', {'15m':'SHORT'})
+    assert not trend_allows('LONG', {})
     with tempfile.TemporaryDirectory() as temp:
         path=str(Path(temp)/'test.sqlite3')
         db=Database(path);t=now_ms()
@@ -517,14 +533,18 @@ def self_test():
         short=[(stamp,200-2*(price-100),flow,-side) for stamp,price,flow,side in trades]
         sv=analyze(short,199.76,t,t,'confirm')
         assert sv and sv['direction']=='SHORT',sv
-        assert db.confirmed_if_eligible(t,'TESTUSDT',val) is None
+        longtrend={'5m':'SHORT','15m':'LONG','1h':'LONG'}
+        shorttrend={'5m':'LONG','15m':'SHORT','1h':'SHORT'}
+        assert db.confirmed_if_eligible(t,'TESTUSDT',val,longtrend) is None
         db.watch(t-1000,'TESTUSDT',val)
-        recorded=db.confirmed_if_eligible(t,'TESTUSDT',val)
+        assert db.confirmed_if_eligible(t,'TESTUSDT',val,{'15m':'LONG'}) is None
+        assert db.confirmed_if_eligible(t,'TESTUSDT',val,{'15m':'LONG','1h':'SHORT'}) is None
+        recorded=db.confirmed_if_eligible(t,'TESTUSDT',val,longtrend)
         assert recorded and len(recorded)==4
         id_,tp,sl,_=recorded
-        assert db.confirmed_if_eligible(t+1000,'TESTUSDT',val) is None
+        assert db.confirmed_if_eligible(t+1000,'TESTUSDT',val,longtrend) is None
         assert db.open_symbols()=={'TESTUSDT'}
-        assert db.update_price('TESTUSDT',tp+.01,t-100)==[]  # earlier trade can't settle
+        assert db.update_price('TESTUSDT',tp+.01,t-100)==[]
         assert db.update_price('TESTUSDT',tp+.01,t+1000)==[(id_,'TP')]
         assert db.update_price('TESTUSDT',sl-.01,t+2000)==[]
         assert db.open_symbols()==set()
@@ -536,12 +556,12 @@ def self_test():
         assert restored.next_notification()[2]=='result'
         assert 'TP=1' in restored.report()
         restored.watch(t-1000,'SHORTUSDT',sv)
-        result=restored.confirmed_if_eligible(t,'SHORTUSDT',sv)
+        result=restored.confirmed_if_eligible(t,'SHORTUSDT',sv,shorttrend)
         assert result
         assert restored.update_price('SHORTUSDT',result[2]+.01,t+2000)==[(result[0],'STOP')]
         assert restored.update_price('SHORTUSDT',result[1]-.01,t+3000)==[]
         assert 'STOP=1' in restored.report()
-    print('PASS V8.4: LONG/SHORT engine, watches, cooldown, TP/STOP, stale-tick guard, duplicate guard, persistent outbox, restart')
+    print('PASS V8.4 TREND: LONG/SHORT gating, missing/conflicting trends, watches, cooldown, TP/STOP, stale-tick guard, duplicate guard, persistent outbox, restart')
 
 def main():
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
