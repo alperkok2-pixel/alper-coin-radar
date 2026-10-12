@@ -1,4 +1,4 @@
-"""ALPER Radar V7 | simple Binance USD-M perpetual PAPER alerts (never trades).
+"""ALPER Radar V7.1 | simple Binance USD-M perpetual PAPER alerts (never trades).
 Python >=3.11, standard library only.
 Run: python -u alper_radar.py    Test: python alper_radar.py --self-test
 Env: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, RADAR_DB (prefer persistent Render disk).
@@ -24,6 +24,9 @@ BASE = 'https://fapi.binance.com'
 TOKEN = os.getenv('TELEGRAM_TOKEN', '').strip()
 CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 DB = os.getenv('RADAR_DB', 'alper_radar_v7.sqlite3')
+MAX_CANDLE_AGE = max(15, int(os.getenv('MAX_CANDLE_AGE_SECONDS', '120')))
+MAX_ENTRY_DRIFT = float(os.getenv('MAX_ENTRY_DRIFT_PCT', '0.35'))
+ALERT_TTL = max(30, int(os.getenv('ENTRY_ALERT_TTL_SECONDS', '180')))
 BATCH = max(1, min(20, int(os.getenv('DETAIL_BATCH', '8'))))
 LOOP = max(60, int(os.getenv('LOOP_SECONDS', '60')))
 GAP = max(1.0, float(os.getenv('REQUEST_GAP_SECONDS', '2.0')))
@@ -82,18 +85,26 @@ def connect():
     c = sqlite3.connect(p)
     c.execute('PRAGMA journal_mode=WAL')
     c.execute('CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entered REAL NOT NULL, stop REAL NOT NULL, tp1 REAL NOT NULL, tp2 REAL NOT NULL, tp3 REAL NOT NULL, opened INTEGER NOT NULL, progress INTEGER NOT NULL DEFAULT 0, closed INTEGER NOT NULL DEFAULT 0, closed_at INTEGER DEFAULT NULL)')
-    c.execute('CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY, message TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL)')
+    c.execute('CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY, message TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT \'info\')')
+    cols = {r[1] for r in c.execute('PRAGMA table_info(alerts)')}
+    if 'kind' not in cols:
+        c.execute("ALTER TABLE alerts ADD COLUMN kind TEXT NOT NULL DEFAULT 'info'")
     c.commit()
     return c
 
 
-def queue(c, message):
-    c.execute('INSERT INTO alerts(message,created) VALUES(?,?)', (message, int(time.time())))
+def queue(c, message, kind='info'):
+    c.execute('INSERT INTO alerts(message,created,kind) VALUES(?,?,?)', (message, int(time.time()), kind))
     c.commit()
 
 
 def send_pending(c):
-    for aid, message in c.execute('SELECT id,message FROM alerts WHERE sent=0 ORDER BY id LIMIT 20').fetchall():
+    for aid, message, created, kind in c.execute('SELECT id,message,created,kind FROM alerts WHERE sent=0 ORDER BY id LIMIT 20').fetchall():
+        if kind == 'entry' and time.time() - created > ALERT_TTL:
+            c.execute('UPDATE alerts SET sent=2 WHERE id=?', (aid,))
+            c.commit()
+            log(f'Expired late entry alert {aid}; not sent')
+            continue
         if not TOKEN or not CHAT:
             log('Telegram keys missing; pending notification retained')
             return
@@ -114,7 +125,7 @@ def candles(symbol, interval, limit):
     now_ms = int(time.time() * 1000)
     # Never use the forming candle as a completed signal.
     return [{'t': int(x[0]), 'h': float(x[2]), 'l': float(x[3]), 'c': float(x[4]),
-             'v': float(x[5])} for x in raw if int(x[6]) < now_ms]
+             'v': float(x[5]), 'close_ms': int(x[6])} for x in raw if int(x[6]) < now_ms]
 
 
 def ema(values, n):
@@ -182,6 +193,25 @@ def levels(side, price):
     return stop, targets
 
 
+def entry_is_fresh(side, signal_bar, price, now_ms=None):
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    age = (now_ms - signal_bar['close_ms']) / 1000
+    if age < 0 or age > MAX_CANDLE_AGE:
+        return False, 'stale_bar'
+    close = signal_bar['c']
+    if close <= 0 or price <= 0:
+        return False, 'invalid_price'
+    drift = 100 * (price / close - 1) * (1 if side == 'LONG' else -1)
+    # A signal with a large favorable move has already departed; do not chase.
+    if drift > MAX_ENTRY_DRIFT:
+        return False, 'chased_price'
+    # Reject a price that has reversed too far against the intended entry.
+    if drift < -MAX_ENTRY_DRIFT:
+        return False, 'reversal'
+    return True, 'fresh'
+
+
 def open_signal(c, symbol, side, price):
     now = int(time.time())
     last = c.execute('SELECT MAX(opened) FROM signals WHERE symbol=? AND side=?', (symbol,side)).fetchone()[0]
@@ -196,7 +226,8 @@ def open_signal(c, symbol, side, price):
     queue(c, f'ALPER V7 PAPER {side} {symbol}\nEntry snapshot: {price:.10g}\n'
           f'TP1: {targets[0]:.10g} (+{TPS[0]}%)\nTP2: {targets[1]:.10g} (+{TPS[1]}%)\n'
           f'TP3: {targets[2]:.10g} (+{TPS[2]}%)\nSTOP: {stop:.10g} (-{STOP}%)\n'
-          'PAPER only. Entry is observed price, not a fill.')
+          f'Signal sent: {dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}\n'
+          'PAPER only. Entry is observed price, not a fill.', kind='entry')
     return True
 
 
@@ -262,7 +293,7 @@ def main():
             if universe:
                 picks = [universe[(cursor+i)%len(universe)] for i in range(min(BATCH,len(universe)))]
                 cursor = (cursor+len(picks)) % len(universe)
-                counts = {'pass':0,'history':0,'trend':0,'rsi':0,'entry':0,'volume':0,'api_error':0}
+                counts = {'pass':0,'history':0,'trend':0,'rsi':0,'entry':0,'volume':0,'api_error':0, 'stale_bar':0, 'chased_price':0, 'reversal':0, 'invalid_price':0}
                 for symbol in picks:
                     try:
                         c1h = candles(symbol,'1h',65)
@@ -273,7 +304,11 @@ def main():
                         if side:
                             # Snapshot price from public ticker (never use stale candle close as entry).
                             now_price = float(api('/fapi/v1/ticker/price',{'symbol':symbol})['price'])
-                            if open_signal(c,symbol,side,now_price):
+                            fresh, cause = entry_is_fresh(side, c5[-1], now_price)
+                            if not fresh:
+                                counts[cause] += 1
+                                log(f'Rejected {symbol} {side}: {cause}')
+                            elif open_signal(c,symbol,side,now_price):
                                 log(f'New PAPER {side} {symbol}')
                     except Exception as exc:
                         counts['api_error'] += 1
@@ -303,9 +338,19 @@ def self_test():
         assert open_signal(c,'BTCUSDT','LONG',100)
         assert not open_signal(c,'BTCUSDT','LONG',100)
         assert c.execute('SELECT COUNT(*) FROM alerts').fetchone()[0] == 1
+        now = int(time.time()*1000)
+        bar = {'close_ms':now-30000, 'c':100}
+        assert entry_is_fresh('LONG',bar,100.1,now)[0]
+        assert entry_is_fresh('SHORT',bar,99.9,now)[0]
+        assert entry_is_fresh('LONG',bar,101,now)[1] == 'chased_price'
+        assert entry_is_fresh('LONG',bar,100,now+200000)[1] == 'stale_bar'
+        assert entry_is_fresh('LONG',bar,99,now)[1] == 'reversal'
+        queue(c,'old entry',kind='entry')
+        c.execute('UPDATE alerts SET created=? WHERE message=?',(int(time.time())-ALERT_TTL-10,'old entry'))
+        c.commit()
         c.close()
     DB = old
-    print('SELF TEST PASS: indicators, target levels, database, cooldown, alert queue')
+    print('SELF TEST PASS: indicators, levels, database, cooldown, freshness, late entry suppression')
 
 
 if __name__ == '__main__':
