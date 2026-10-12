@@ -1,7 +1,8 @@
-"""ALPER Radar V6.4 — Binance USD-M futures PAPER signal radar.
+"""ALPER Radar V6.5 — Binance USD-M futures PAPER signal radar.
 Python 3.11+; standard library only. NEVER submits orders.
 Start: python -u alper_radar.py   Test: python alper_radar.py --self-test
 Telegram secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (Render environment).
+Performance diagnostics: logs slow API requests, shared-IP pauses, and per-symbol scan times.
 Optional: TP1_PCT=1.5, TP2_PCT=2.5, TP3_PCT=5, MIN_VOLUME_RATIO=1.3, DETAIL_BATCH=12,
 SCAN_SECONDS=60, REQUEST_GAP_SECONDS=2.5, MAX_STOP_PCT=1.5,
 MIN_24H_VOLUME=30000000, SIGNAL_COOLDOWN_HOURS=12, MIN_ADX=18, MIN_SCORE=4.
@@ -48,6 +49,8 @@ _last_api_call = 0.0
 _pause_until = 0.0
 _used_weight = 0
 _weight_seen_at = 0.0
+_api_counts = {"calls": 0, "seconds": 0.0, "wait_seconds": 0.0, "cache_hits": 0}
+_candle_cache_5m = {}
 
 
 def log(s):
@@ -61,23 +64,39 @@ def fetch(base, path, params=None, attempts=3):
         url += "?" + urllib.parse.urlencode(params)
     for attempt in range(attempts):
         delay = max(0, _pause_until - time.monotonic())
+        reason = "cooldown" if delay else ""
         if base == BASE:
-            delay = max(delay, REQUEST_GAP - (time.monotonic() - _last_api_call))
+            pacing = max(0, REQUEST_GAP - (time.monotonic() - _last_api_call))
+            if pacing > delay:
+                delay, reason = pacing, "pacing"
             if _used_weight >= WEIGHT_SOFT_LIMIT and time.monotonic() - _weight_seen_at < 62:
-                delay = max(delay, 65 - (time.monotonic() - _weight_seen_at))
+                weight_wait = max(0, 65 - (time.monotonic() - _weight_seen_at))
+                if weight_wait > delay:
+                    delay, reason = weight_wait, "shared-IP weight"
         if delay:
+            _api_counts["wait_seconds"] += delay
+            if delay >= 10:
+                log(f"API wait {delay:.1f}s ({reason}); weight={_used_weight}; endpoint={path}")
             time.sleep(delay)
+        started_request = time.monotonic()
         if base == BASE:
-            _last_api_call = time.monotonic()
+            _last_api_call = started_request
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": "ALPER-Radar-Paper/6.3"})
+            request = urllib.request.Request(url, headers={"User-Agent": "ALPER-Radar-Paper/6.5"})
             with urllib.request.urlopen(request, timeout=18) as response:
                 if base == BASE:
                     raw_weight = response.headers.get("X-MBX-USED-WEIGHT-1M")
                     if raw_weight is not None:
                         _used_weight = int(raw_weight)
                         _weight_seen_at = time.monotonic()
-                return json.loads(response.read().decode("utf-8"))
+                payload = json.loads(response.read().decode("utf-8"))
+                if base == BASE:
+                    elapsed = time.monotonic() - started_request
+                    _api_counts["calls"] += 1
+                    _api_counts["seconds"] += elapsed
+                    if elapsed >= 4:
+                        log(f"API slow response {elapsed:.1f}s {path}")
+                return payload
         except urllib.error.HTTPError as exc:
             if exc.code in (418, 429):
                 raw = exc.headers.get("Retry-After", "180")
@@ -149,8 +168,25 @@ def closes_only(klines):
 
 
 def candles(symbol, interval, limit=120):
-    rows = fetch(BASE, "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    return closes_only(rows)
+    # Only reuse 5m history while its latest CLOSED candle is still current.
+    # This avoids needless repeated requests for the same coin within a 5m bar.
+    if interval == "5m" and limit == 120:
+        item = _candle_cache_5m.get(symbol)
+        if item and time.time() * 1000 < item[0]:
+            _api_counts["cache_hits"] += 1
+            return item[1]
+    rows = closes_only(fetch(BASE, "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit}))
+    if interval == "5m" and limit == 120 and rows:
+        # The last candle's close timestamp is inclusive (usually ..:59.999).
+        # Invalidate on its successor's close + a 1.5s data-settlement margin.
+        expires_ms = int(rows[-1][6]) + 300000 + 1500
+        _candle_cache_5m[symbol] = (expires_ms, rows)
+        if len(_candle_cache_5m) > 800:
+            now_ms = time.time() * 1000
+            for key, (expiry, _) in list(_candle_cache_5m.items()):
+                if expiry <= now_ms:
+                    del _candle_cache_5m[key]
+    return rows
 
 
 def ema(values, length):
@@ -434,6 +470,7 @@ def scan(con, symbols, cache=None):
     sent = 0
     log(f"Detailed scan BEGIN: {len(symbols)} symbols")
     for i, symbol in enumerate(symbols, 1):
+        t0 = time.monotonic()
         log(f"Detailed progress: {i}/{len(symbols)} {symbol}")
         try:
             s5 = candles(symbol, "5m")
@@ -457,7 +494,7 @@ def scan(con, symbols, cache=None):
                                     (symbol, side, found["close_ms"])).fetchone()
             if duplicate:
                 continue
-            msg = (f"🚨 ALPER Radar V6.4 | PAPER {side}\n{symbol}\n"
+            msg = (f"🚨 ALPER Radar V6.5 | PAPER {side}\n{symbol}\n"
                    f"Reference entry: {found['entry']:.9g}\n"
                    f"🎯 TP1 (+{TP_LEVELS[0]:g}%): {found['tp1']:.9g}\n"
                    f"🎯 TP2 (+{TP_LEVELS[1]:g}%): {found['tp2']:.9g}\n"
@@ -479,6 +516,10 @@ def scan(con, symbols, cache=None):
             log(f"Scan skipped {symbol}: {exc}")
         except Exception as exc:
             log(f"Scan skipped {symbol}: {type(exc).__name__} {exc}")
+        finally:
+            duration = time.monotonic() - t0
+            if duration >= 15:
+                log(f"Detailed slow symbol {symbol}: {duration:.1f}s")
     return sent
 
 
@@ -587,8 +628,8 @@ def main():
     if not (0.2 <= TP_LEVELS[0] < TP_LEVELS[1] < TP_LEVELS[2] <= 30 and 0.3 <= STOP_LIMIT <= 5):
         raise ValueError("Check TP1_PCT/TP2_PCT/TP3_PCT and MAX_STOP_PCT")
     con = db_connect()
-    log("ALPER Radar V6.4 PAPER started; order execution DISABLED")
-    notify(f"✅ ALPER Radar V6.4 started (PAPER only)\nPrice targets TP1={TP_LEVELS[0]:g}%, TP2={TP_LEVELS[1]:g}%, TP3={TP_LEVELS[2]:g}% (not leverage)\nAll USDT perpetuals bulk-screened; detailed analysis is prioritized and rotating")
+    log("ALPER Radar V6.5 PAPER started; order execution DISABLED")
+    notify(f"✅ ALPER Radar V6.5 started (PAPER only)\nPrice targets TP1={TP_LEVELS[0]:g}%, TP2={TP_LEVELS[1]:g}%, TP3={TP_LEVELS[2]:g}% (not leverage)\nAll USDT perpetuals bulk-screened; detailed analysis is prioritized and rotating")
     cycle = 0
     symbols, hot = [], []
     cache = {}
@@ -598,6 +639,7 @@ def main():
     last_screen = 0.0
     while True:
         begun = time.monotonic()
+        before_api = dict(_api_counts)
         try:
             if not symbols or begun - last_universe_refresh >= UNIVERSE_REFRESH_SECONDS:
                 symbols = universe()
@@ -625,11 +667,15 @@ def main():
                 monitor(con)
             found = scan(con, batch, cache)
             log(f"Detailed scan: {len(batch)} / {len(symbols)} listed; hot={len(hot)}; {found} new signal(s)")
+            log(f"Cycle timing: {time.monotonic()-begun:.1f}s; API calls={_api_counts['calls']-before_api['calls']}; "
+                f"API transfer={_api_counts['seconds']-before_api['seconds']:.1f}s; "
+                f"API waits={_api_counts['wait_seconds']-before_api['wait_seconds']:.1f}s; "
+                f"5m cache hits={_api_counts['cache_hits']-before_api['cache_hits']}")
             if cycle % 30 == 0:
                 open_count = con.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
                 stats = con.execute("SELECT strategy,status,COUNT(*) FROM trades GROUP BY strategy,status").fetchall()
                 overview = "; ".join(f"{a}:{b}={c}" for a,b,c in stats)[:600] or "no trades yet"
-                notify(f"💚 ALPER Radar V6.4 health | {len(symbols)} bulk-screened | {len(batch)} detailed | {found} signals | {open_count} open paper signals\n{overview}")
+                notify(f"💚 ALPER Radar V6.5 health | {len(symbols)} bulk-screened | {len(batch)} detailed | {found} signals | {open_count} open paper signals\n{overview}")
             cycle += 1
         except KeyboardInterrupt:
             raise
