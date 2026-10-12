@@ -1,4 +1,4 @@
-"""ALPER Radar V8.2 QUIET: PAPER-ONLY Binance USDT perpetual early watch + confirmation.
+"""ALPER Radar V8.3 MEASURE: PAPER-ONLY Binance USDT perpetual early watch + confirmation.
 Python 3.11+, pip install websocket-client==1.9.0
 Run: python -u alper_radar.py ; test: python alper_radar.py --self-test
 Environment: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, FOLLOW_COUNT=20,
@@ -7,6 +7,8 @@ No exchange keys, no orders, no profitability guarantees.
 """
 from __future__ import annotations
 import collections
+import datetime as dt
+import statistics
 import fcntl
 import json
 import logging
@@ -43,6 +45,9 @@ FLOW_RATIO = max(.65, min(.95, float(os.getenv('FLOW_RATIO', '.72'))))
 BURST_RATIO = max(1.3, float(os.getenv('BURST_RATIO', '1.8')))
 COOLDOWN_SECONDS = 3 * 3600
 WATCH_COOLDOWN = 20 * 60
+# Measurements are advisory: trend never blocks a V8.2 confirmation.
+REPORT_INTERVAL = max(1800, int(os.getenv("REPORT_INTERVAL_SECONDS", "3600")))
+TREND_REFRESH = max(300, int(os.getenv("TREND_REFRESH_SECONDS", "900")))
 STOP = threading.Event()
 
 def now_ms(): return int(time.time() * 1000)
@@ -53,7 +58,7 @@ def number(value, default=0.):
     except (TypeError, ValueError, OverflowError): return default
 
 def api(path):
-    req = urllib.request.Request(REST+path, headers={'User-Agent':'ALPER-Paper-Radar/8.2'})
+    req = urllib.request.Request(REST+path, headers={'User-Agent':'ALPER-Paper-Radar/8.3'})
     with urllib.request.urlopen(req, timeout=20) as r: return json.load(r)
 
 def universe():
@@ -134,6 +139,12 @@ class Database:
                 stop REAL NOT NULL, status TEXT NOT NULL DEFAULT 'OPEN',
                 closed INTEGER, exit_price REAL, flow_ratio REAL, burst REAL)''')
             self.con.execute('CREATE INDEX IF NOT EXISTS open_status ON signals(status,symbol)')
+            # Additive migration: compatible with existing V8.2 databases.
+            existing={r[1] for r in self.con.execute('PRAGMA table_info(signals)')}
+            for col,typ in [('watch_delay_ms','INTEGER'),('telegram_delay_ms','INTEGER'),
+                            ('trend_5m','TEXT'),('trend_15m','TEXT'),('trend_1h','TEXT'),
+                            ('gross_pct','REAL'),('net_est_pct','REAL')]:
+                if col not in existing:self.con.execute(f'ALTER TABLE signals ADD COLUMN {col} {typ}')
             self.con.execute('''CREATE TABLE IF NOT EXISTS watches(
                 id INTEGER PRIMARY KEY, created INTEGER NOT NULL, symbol TEXT NOT NULL,
                 direction TEXT NOT NULL, price REAL NOT NULL, status TEXT NOT NULL DEFAULT 'WATCH',
@@ -151,7 +162,7 @@ class Database:
             self.con.execute('INSERT INTO watches(created,symbol,direction,price) VALUES(?,?,?,?)',
                              (ts,symbol,val['direction'],val['price']))
             self.con.commit()
-    def confirmed(self,ts,symbol,val):
+    def confirmed(self,ts,symbol,val,trend=None,watch_delay_ms=None):
         p=val['price']; long=val['direction']=='LONG'
         tp=p*(1.015 if long else .985)
         sl=p*(.9925 if long else 1.0075)
@@ -159,6 +170,8 @@ class Database:
             cur=self.con.execute('''INSERT INTO signals(created,symbol,direction,entry,tp,stop,status,flow_ratio,burst)
                         VALUES(?,?,?,?,?,?,'OPEN',?,?)''',
                         (ts,symbol,val['direction'],p,tp,sl,val['strength'],val['burst']))
+            self.con.execute('UPDATE signals SET watch_delay_ms=?,trend_5m=?,trend_15m=?,trend_1h=? WHERE id=?',
+                             (watch_delay_ms,(trend or {}).get('5m'),(trend or {}).get('15m'),(trend or {}).get('1h'),cur.lastrowid))
             self.con.execute("UPDATE watches SET status='CONFIRMED',resolved=? WHERE symbol=? AND direction=? AND status='WATCH' AND created>=?",
                              (ts,symbol,val['direction'],ts-10*60*1000))
             self.con.commit()
@@ -168,6 +181,28 @@ class Database:
             self.con.execute("UPDATE watches SET status='EXPIRED',resolved=? WHERE status='WATCH' AND created<?",
                              (ts,ts-10*60*1000))
             self.con.commit()
+    def set_telegram_delay(self,id_,delay_ms):
+        with self.lock:
+            self.con.execute('UPDATE signals SET telegram_delay_ms=? WHERE id=?',(delay_ms,id_))
+            self.con.commit()
+    def report(self):
+        with self.lock:
+            rows=self.con.execute("SELECT status,entry,exit_price,direction,trend_15m,watch_delay_ms,telegram_delay_ms FROM signals").fetchall()
+        counts=collections.Counter(r[0] for r in rows)
+        closed=[r for r in rows if r[0] in ('TP','STOP') and r[2] is not None and r[1]>0]
+        pnl=[(r[2]/r[1]-1)*100*(1 if r[3]=='LONG' else -1) for r in closed]
+        matching=[r for r in closed if r[4] in ('LONG','SHORT') and r[4]==r[3]]
+        contrary=[r for r in closed if r[4] in ('LONG','SHORT') and r[4]!=r[3]]
+        def wins(group):return f'{sum(r[0]=="TP" for r in group)}/{len(group)}' if group else '0/0'
+        delays=[r[5]/1000 for r in rows if r[5] is not None]
+        # Recorded movement is a proxy; no fee or slippage model is presumed.
+        return (f'REPORT all-time recorded | TP={counts["TP"]} STOP={counts["STOP"]} OPEN={counts["OPEN"]} '
+                f'win={wins(closed)} | gross_observed_sum={sum(pnl):+.2f}% '
+                f'(not portfolio return) | trend15 agree={wins(matching)} disagree={wins(contrary)} '
+                f'| watch-to-confirm median={statistics.median(delays):.1f}s' if delays else
+                f'REPORT all-time recorded | TP={counts["TP"]} STOP={counts["STOP"]} OPEN={counts["OPEN"]} '
+                f'win={wins(closed)} | gross_observed_sum={sum(pnl):+.2f}% (not portfolio return) '
+                f'| trend15 agree={wins(matching)} disagree={wins(contrary)} | no delay samples')
     def update_price(self,symbol,price,ts):
         with self.lock:
             rows=self.con.execute("SELECT id,direction,tp,stop FROM signals WHERE status='OPEN' AND symbol=?",(symbol,)).fetchall()
@@ -188,6 +223,8 @@ class Radar:
         self.next_follow=set();self.rotation=0;self.candidate_updated=0
         self.last_market=0;self.last_trade=0;self.last_status=0
         self.notify=queue.Queue(maxsize=500)
+        self.trend={}  # Symbol -> ({5m,15m,1h}, fetched_at), advisory only
+        self.last_report=now_ms()
     def bootstrap(self):
         self.allowed=universe()
         for item in api('/fapi/v1/ticker/24hr'):
@@ -213,6 +250,35 @@ class Radar:
             self.last_market=now_ms()
         for id_,status in self.db.update_price(sym,price,ts):
             self.enqueue(f'ALPER V8.2 | SANAL SONUÇ #{id_}: {sym} {status} | gözlenen {price:.9g}',180,'result')
+    def trend_snapshot(self,sym):
+        with self.lock:
+            data=self.trend.get(sym)
+            return dict(data[0]) if data and now_ms()-data[1]<2*TREND_REFRESH*1000 else {}
+    def trend_worker(self):
+        # Rate-limited REST lookups on shortlist only. Closed candles, no forming-candle lookahead.
+        while not STOP.is_set():
+            with self.lock: symbols=sorted(self.next_follow)
+            for sym in symbols:
+                if STOP.is_set():break
+                with self.lock: old=self.trend.get(sym)
+                if old and now_ms()-old[1]<TREND_REFRESH*1000:continue
+                readings={}
+                for interval in ('5m','15m','1h'):
+                    try:
+                        path='/fapi/v1/klines?'+urllib.parse.urlencode({'symbol':sym,'interval':interval,'limit':22})
+                        candles=api(path)
+                        closed=[c for c in candles if int(c[6])<now_ms()]
+                        if len(closed)<20:continue
+                        closes=[number(c[4]) for c in closed]
+                        fast=sum(closes[-5:])/5; slow=sum(closes[-20:])/20
+                        readings[interval]='LONG' if fast>slow else 'SHORT' if fast<slow else 'FLAT'
+                    except Exception as exc:
+                        LOG.warning('TREND unavailable %s %s: %s',sym,interval,exc)
+                        break
+                    STOP.wait(.5) # safety pacing, no effect on trade websocket
+                if readings:
+                    with self.lock:self.trend[sym]=(readings,now_ms())
+            STOP.wait(20)
     def on_trade(self,item):
         if item.get('e')!='aggTrade':return
         sym=item.get('s','');ts=int(item.get('T') or 0)
@@ -245,13 +311,17 @@ class Radar:
             eligible=self.db.con.execute("SELECT 1 FROM watches WHERE symbol=? AND direction=? AND status='WATCH' AND created<? AND created>=? LIMIT 1",
                                         (sym,confirmed['direction'],current,current-10*60*1000)).fetchone()
             if not eligible or self.db.open_exists(sym):return
-            id_,tp,sl=self.db.confirmed(current,sym,confirmed)
-        self.enqueue(f'✅ ALPER V8.2 | ONAYLI SANAL {confirmed["direction"]}\n'
+            watch_row=self.db.con.execute("SELECT created FROM watches WHERE symbol=? AND direction=? AND status='WATCH' AND created<? AND created>=? ORDER BY created DESC LIMIT 1",
+                                          (sym,confirmed['direction'],current,current-10*60*1000)).fetchone()
+            delay=current-watch_row[0] if watch_row else None
+            trend=self.trend_snapshot(sym)
+            id_,tp,sl=self.db.confirmed(current,sym,confirmed,trend,delay)
+        self.enqueue(f'✅ ALPER V8.3 | ONAYLI SANAL {confirmed["direction"]}\n'
                      f'{sym} | giriş referansı: {price:.9g}\nTP (+1.5%): {tp:.9g}\n'
                      f'STOP (-0.75%): {sl:.9g}\nAkış baskısı %{confirmed["strength"]*100:.0f}, '
                      f'ivme {confirmed["burst"]:.1f}x | fiyat hareketi %{confirmed["move"]:.2f}\n'
                      f'Kayıt #{id_} | işlem tavsiyesi değildir.',25,'entry')
-        LOG.info('CONFIRMED %s %s #%d',sym,confirmed['direction'],id_)
+        LOG.info('CONFIRMED %s %s #%d watch_delay=%s trend=%s',sym,confirmed['direction'],id_,delay,trend)
     def choose_follow(self):
         t=now_ms()
         with self.lock:
@@ -352,7 +422,7 @@ class Radar:
     def run(self):
         self.bootstrap()
         self.enqueue(f'ALPER Radar V8.2 başladı | {len(self.allowed)} USDT perpetual | yalnızca sanal takip',120,'startup')
-        for worker in (self.notifier,self.market_worker,self.trade_worker):
+        for worker in (self.notifier,self.market_worker,self.trade_worker,self.trend_worker):
             threading.Thread(target=worker,daemon=True,name=worker.__name__).start()
         while not STOP.wait(5):
             t=now_ms()
@@ -365,6 +435,9 @@ class Radar:
                          (t-self.last_trade)/1000 if self.last_trade else -1,
                          len(self.followed),self.notify.qsize())
                 self.last_status=t
+            if t-self.last_report>=REPORT_INTERVAL*1000:
+                LOG.info(self.db.report())
+                self.last_report=t
 
 def self_test():
     import tempfile
@@ -398,7 +471,9 @@ def self_test():
         radar.enqueue('CONFIRM',kind='entry')
         radar.enqueue('TP',kind='result')
         assert [radar.notify.get_nowait()[0] for _ in range(2)]==['CONFIRM','TP']
-    print('PASS: LONG, SHORT, stale rejection, countertrend rejection, watch confirmation, cooldown, TP closure, Telegram quiet filter')
+        assert 'TP=1' in db.report()
+        assert 'trend_15m' in {r[1] for r in db.con.execute('PRAGMA table_info(signals)')}
+    print('PASS V8.3: LONG, SHORT, stale rejection, countertrend rejection, watch confirmation, cooldown, TP closure, Telegram quiet filter')
 
 def main():
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
