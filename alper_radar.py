@@ -1,18 +1,12 @@
-"""ALPER Radar V8.1 — experimental Binance USD-M perpetual early-warning PAPER radar.
-
-Python 3.11+. Install: pip install -r requirements.txt
-Start: python -u alper_radar.py     Test: python alper_radar.py --self-test
-Environment: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (optional for offline testing).
-No account keys, no orders. Signals are hypotheses, not guaranteed predictions.
-
-Design: all market mini-tickers via ONE stream; rotate a limited list of
-aggTrade streams for *actual executed buy/sell flow*; reject stale, chased,
-low-liquidity signals; SQLite outcomes; cooldown; retry stale-safe notifications.
-Order-book/OI are deliberately NOT claimed in this version.
+"""ALPER Radar V8.2: PAPER-ONLY Binance USDT perpetual early watch + confirmation.
+Python 3.11+, pip install websocket-client==1.9.0
+Run: python -u alper_radar.py ; test: python alper_radar.py --self-test
+Environment: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, FOLLOW_COUNT=20,
+FOLLOW_REFRESH_SECONDS=60, MIN_24H_QUOTE=15000000, RADAR_DB=alper_radar.sqlite3.
+No exchange keys, no orders, no profitability guarantees.
 """
 from __future__ import annotations
 import collections
-import datetime as dt
 import fcntl
 import json
 import logging
@@ -25,12 +19,10 @@ import sqlite3
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-
 try:
     import websocket
 except ImportError:
@@ -38,61 +30,43 @@ except ImportError:
 
 LOG = logging.getLogger('ALPER')
 REST = 'https://fapi.binance.com'
-# Both legacy /ws/ and new /market/ws/ address formats exist; current docs show /market/ws/.
-WS = os.getenv('BINANCE_WS_BASE', 'wss://fstream.binance.com/market/ws')
+WS = os.getenv('BINANCE_WS_BASE', 'wss://fstream.binance.com/market/ws').rstrip('/')
 DB = os.getenv('RADAR_DB', 'alper_radar.sqlite3')
-MIN_QUOTE = float(os.getenv('MIN_24H_QUOTE', '15000000'))
-FOLLOW_COUNT = max(5, min(40, int(os.getenv('FOLLOW_COUNT', '20'))))
-REFRESH = max(180, int(os.getenv('FOLLOW_REFRESH_SECONDS', '240')))
-MIN_TRADES = max(8, int(os.getenv('MIN_AGG_TRADES', '20')))
-MIN_FLOW_USDT = float(os.getenv('MIN_FLOW_USDT', '12000'))
-FLOW_RATIO = max(0.65, float(os.getenv('FLOW_RATIO', '0.72')))
-BURST_RATIO = max(1.3, float(os.getenv('BURST_RATIO', '1.8')))
-MAX_CHASE_PCT = float(os.getenv('MAX_CHASE_PCT', '0.30'))
-MAX_SQUEEZE_PCT = float(os.getenv('MAX_SQUEEZE_PCT', '0.65'))
-ALERT_TTL = 25
-COOLDOWN_SECONDS = 3 * 60 * 60
-MIN_DIRECTION_MOVE_PCT = 0.045  # confirmed movement, not a predicted 3-5 minute lead
-MAX_DIRECTION_MOVE_PCT = 0.24
-MIN_RECENT_PRICE_MOVE_PCT = 0.015
 TOKEN = os.getenv('TELEGRAM_TOKEN', '').strip()
 CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+FOLLOW_COUNT = max(5, min(40, int(os.getenv('FOLLOW_COUNT', '20'))))
+REFRESH = max(60, int(os.getenv('FOLLOW_REFRESH_SECONDS', '60')))
+MIN_QUOTE = float(os.getenv('MIN_24H_QUOTE', '15000000'))
+MIN_TRADES = max(8, int(os.getenv('MIN_AGG_TRADES', '20')))
+MIN_FLOW_USDT = float(os.getenv('MIN_FLOW_USDT', '12000'))
+FLOW_RATIO = max(.65, min(.95, float(os.getenv('FLOW_RATIO', '.72'))))
+BURST_RATIO = max(1.3, float(os.getenv('BURST_RATIO', '1.8')))
+COOLDOWN_SECONDS = 3 * 3600
+WATCH_COOLDOWN = 20 * 60
 STOP = threading.Event()
 
-
 def now_ms(): return int(time.time() * 1000)
-
-def safe_num(x, default=0.0):
+def number(value, default=0.):
     try:
-        val = float(x)
-        return val if math.isfinite(val) else default
-    except (TypeError, ValueError, OverflowError):
-        return default
+        n = float(value)
+        return n if math.isfinite(n) else default
+    except (TypeError, ValueError, OverflowError): return default
 
-
-def api_json(path, params=None):
-    url = REST + path
-    if params: url += '?' + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers={'User-Agent': 'ALPER-Paper-Radar/8.1'})
-    with urllib.request.urlopen(request, timeout=20) as resp:
-        return json.load(resp)
-
+def api(path):
+    req = urllib.request.Request(REST+path, headers={'User-Agent':'ALPER-Paper-Radar/8.2'})
+    with urllib.request.urlopen(req, timeout=20) as r: return json.load(r)
 
 def universe():
-    """Only trading USDT perpetual USD-M contracts; avoids COIN-M mixed streams."""
-    d = api_json('/fapi/v1/exchangeInfo')
-    return {x['symbol'] for x in d.get('symbols', []) if
-            x.get('status') == 'TRADING' and x.get('contractType') == 'PERPETUAL'
-            and x.get('quoteAsset') == 'USDT'}
-
+    data = api('/fapi/v1/exchangeInfo')
+    return {x['symbol'] for x in data.get('symbols', []) if x.get('status')=='TRADING'
+            and x.get('contractType')=='PERPETUAL' and x.get('quoteAsset')=='USDT'}
 
 @dataclass
 class PriceState:
-    price: float = 0.0
-    quote: float = 0.0
+    price: float = 0
+    quote: float = 0
     updated: int = 0
-    history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=360))
-
+    history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=180))
 
 @dataclass
 class TradeState:
@@ -100,290 +74,267 @@ class TradeState:
     started: int = 0
 
 
-def compute_signal(trades, price, fresh_ms, at_ms=None):
-    """Pure scoring routine; return signal dict or None. Needs >90s market history.
-
-    Two 45-second windows: current volume must accelerate vs prior window;
-    current buyer/seller taker aggression strong; price should still be close
-    to start-of-window (the move should NOT already have happened).
+def analyze(trades, price, updated, at=None, mode='confirm'):
+    """Two stages, both require real trades and directional agreement.
+    WATCH uses 20+20 sec, CONFIRM uses 45+45 sec. Not a prediction.
     """
-    at_ms = at_ms or now_ms()
-    if at_ms - fresh_ms > 4500 or price <= 0: return None
-    recent = [(t,p,q,side) for t,p,q,side in trades if 0 <= at_ms-t <= 90000]
-    first = [(t,p,q,side) for t,p,q,side in recent if at_ms-t > 45000]
-    last = [(t,p,q,side) for t,p,q,side in recent if at_ms-t <= 45000]
-    if len(first) < MIN_TRADES or len(last) < MIN_TRADES: return None
+    at = now_ms() if at is None else at
+    if price <= 0 or not 0 <= at-updated <= 4500: return None
+    window = 20_000 if mode=='watch' else 45_000
+    minimum_trades = max(7, MIN_TRADES//2) if mode=='watch' else MIN_TRADES
+    chosen = [(t,p,q,side) for t,p,q,side in trades if 0 <= at-t <= 2*window]
+    first = [x for x in chosen if at-x[0] > window]
+    last = [x for x in chosen if at-x[0] <= window]
+    if len(first)<minimum_trades or len(last)<minimum_trades: return None
     before = sum(x[2] for x in first)
     current = sum(x[2] for x in last)
-    if before < MIN_FLOW_USDT / 4 or current < MIN_FLOW_USDT: return None
-    if current / max(before, 1) < BURST_RATIO: return None
-    buying = sum(x[2] for x in last if x[3] == 1)
-    frac = buying / current
-    if frac >= FLOW_RATIO: direction = 'LONG'; strength = frac
-    elif (1-frac) >= FLOW_RATIO: direction = 'SHORT'; strength = 1-frac
+    min_flow = MIN_FLOW_USDT*.65 if mode=='watch' else MIN_FLOW_USDT
+    min_burst = max(1.3, BURST_RATIO*.85) if mode=='watch' else BURST_RATIO
+    min_ratio = max(.65, FLOW_RATIO-.04) if mode=='watch' else FLOW_RATIO
+    if before < min_flow/4 or current < min_flow: return None
+    burst = current/max(before,1)
+    if burst < min_burst: return None
+    buys = sum(x[2] for x in last if x[3]==1)
+    frac = buys/current
+    if frac>=min_ratio: direction='LONG'; strength=frac
+    elif 1-frac>=min_ratio: direction='SHORT'; strength=1-frac
     else: return None
-    prices = [x[1] for x in last] + [price]
-    lo, hi = min(prices), max(prices)
-    if (hi-lo) / price * 100 > MAX_SQUEEZE_PCT: return None
-    first_price = first[-1][1]
-    drift_pct = (price / first_price - 1) * 100
-    # Avoid chasing a move already underway in intended direction.
-    aligned_move = drift_pct if direction == 'LONG' else -drift_pct
-    # Do not confuse contrarian absorption / reversal with continuation:
-    # taker buy pressure plus a falling price is NOT an automatic long.
-    if not MIN_DIRECTION_MOVE_PCT <= aligned_move <= min(MAX_DIRECTION_MOVE_PCT, MAX_CHASE_PCT): return None
-    # The final 22s must also agree with the signal direction.
-    recent_start = min((x for x in last if at_ms-x[0] <= 22000), key=lambda x:x[0], default=None)
-    if recent_start is None: return None
-    recent_move = (price / recent_start[1] - 1) * 100
-    aligned_recent = recent_move if direction == 'LONG' else -recent_move
-    if aligned_recent < MIN_RECENT_PRICE_MOVE_PCT: return None
-    # Require order-flow persistence across subwindows; one large print isn't enough.
-    halves = ([x for x in last if at_ms-x[0] > 22000],
-              [x for x in last if at_ms-x[0] <= 22000])
-    for part in halves:
-        volume = sum(x[2] for x in part)
-        if len(part) < 6 or volume <= 0: return None
-        buy = sum(x[2] for x in part if x[3] == 1)
-        same = buy / volume if direction == 'LONG' else 1-buy / volume
-        if same < 0.62: return None
-    return {'direction': direction, 'strength': strength,
-            'burst': current/max(before,1), 'price': price,
-            'flow': current, 'age_ms': at_ms-fresh_ms, 'confirmed_move_pct': aligned_move}
-
+    drift = (price/first[-1][1]-1)*100
+    move = drift if direction=='LONG' else -drift
+    lower = .02 if mode=='watch' else .045
+    upper = .18 if mode=='watch' else .24
+    if not lower <= move <= upper: return None
+    prices = [x[1] for x in last]+[price]
+    if (max(prices)-min(prices))/price*100 > (.40 if mode=='watch' else .65): return None
+    half_window = window//2
+    halves = ([x for x in last if at-x[0]>half_window],
+              [x for x in last if at-x[0]<=half_window])
+    for half in halves:
+        volume=sum(x[2] for x in half)
+        if len(half)<4 or volume<=0: return None
+        buy=sum(x[2] for x in half if x[3]==1)
+        same=buy/volume if direction=='LONG' else 1-buy/volume
+        if same<.60: return None
+    recent = min(halves[1], key=lambda x:x[0], default=None)
+    if recent is None:return None
+    last_move = (price/recent[1]-1)*100*(1 if direction=='LONG' else -1)
+    if last_move < (.008 if mode=='watch' else .015): return None
+    return {'direction':direction,'price':price,'strength':strength,
+            'burst':burst,'flow':current,'move':move,'age_ms':at-updated}
 
 class Database:
-    def __init__(self, path=DB):
-        self.con = sqlite3.connect(path, check_same_thread=False, timeout=20)
-        self.lock = threading.RLock()
+    def __init__(self,path=DB):
+        self.lock=threading.RLock()
+        self.con=sqlite3.connect(path,check_same_thread=False,timeout=20)
         with self.lock:
             self.con.execute('PRAGMA journal_mode=WAL')
             self.con.execute('''CREATE TABLE IF NOT EXISTS signals(
-              id INTEGER PRIMARY KEY, created INTEGER NOT NULL, symbol TEXT NOT NULL,
-              direction TEXT NOT NULL, entry REAL NOT NULL, tp REAL NOT NULL,
-              stop REAL NOT NULL, status TEXT NOT NULL DEFAULT 'OPEN',
-              closed INTEGER, exit_price REAL, flow_ratio REAL, burst REAL)''')
+                id INTEGER PRIMARY KEY, created INTEGER NOT NULL, symbol TEXT NOT NULL,
+                direction TEXT NOT NULL, entry REAL NOT NULL, tp REAL NOT NULL,
+                stop REAL NOT NULL, status TEXT NOT NULL DEFAULT 'OPEN',
+                closed INTEGER, exit_price REAL, flow_ratio REAL, burst REAL)''')
             self.con.execute('CREATE INDEX IF NOT EXISTS open_status ON signals(status,symbol)')
+            self.con.execute('''CREATE TABLE IF NOT EXISTS watches(
+                id INTEGER PRIMARY KEY, created INTEGER NOT NULL, symbol TEXT NOT NULL,
+                direction TEXT NOT NULL, price REAL NOT NULL, status TEXT NOT NULL DEFAULT 'WATCH',
+                resolved INTEGER)''')
             self.con.commit()
-    def recent(self, symbol, direction, timestamp):
+    def recent(self,table,symbol,direction,ts,period):
         with self.lock:
-            result = self.con.execute('SELECT 1 FROM signals WHERE symbol=? AND direction=? AND created>? LIMIT 1',
-                      (symbol,direction,timestamp-COOLDOWN_SECONDS*1000)).fetchone()
-        return result is not None
-    def insert(self, timestamp, symbol, value):
-        p = value['price']; is_long = value['direction']=='LONG'
-        tp = p * (1.015 if is_long else .985)
-        sl = p * (.9925 if is_long else 1.0075)
+            return self.con.execute(f'SELECT 1 FROM {table} WHERE symbol=? AND direction=? AND created>? LIMIT 1',
+                                    (symbol,direction,ts-period*1000)).fetchone() is not None
+    def open_exists(self,symbol):
+        with self.lock:
+            return self.con.execute("SELECT 1 FROM signals WHERE symbol=? AND status='OPEN' LIMIT 1",(symbol,)).fetchone() is not None
+    def watch(self,ts,symbol,val):
+        with self.lock:
+            self.con.execute('INSERT INTO watches(created,symbol,direction,price) VALUES(?,?,?,?)',
+                             (ts,symbol,val['direction'],val['price']))
+            self.con.commit()
+    def confirmed(self,ts,symbol,val):
+        p=val['price']; long=val['direction']=='LONG'
+        tp=p*(1.015 if long else .985)
+        sl=p*(.9925 if long else 1.0075)
         with self.lock:
             cur=self.con.execute('''INSERT INTO signals(created,symbol,direction,entry,tp,stop,status,flow_ratio,burst)
-                                    VALUES(?,?,?,?,?,?,'OPEN',?,?)''',
-                      (timestamp,symbol,value['direction'],p,tp,sl,value['strength'],value['burst']))
+                        VALUES(?,?,?,?,?,?,'OPEN',?,?)''',
+                        (ts,symbol,val['direction'],p,tp,sl,val['strength'],val['burst']))
+            self.con.execute("UPDATE watches SET status='CONFIRMED',resolved=? WHERE symbol=? AND direction=? AND status='WATCH' AND created>=?",
+                             (ts,symbol,val['direction'],ts-10*60*1000))
             self.con.commit()
-            return cur.lastrowid, tp, sl
-    def update_price(self, symbol, price, timestamp):
+            return cur.lastrowid,tp,sl
+    def expire_watches(self,ts):
+        with self.lock:
+            self.con.execute("UPDATE watches SET status='EXPIRED',resolved=? WHERE status='WATCH' AND created<?",
+                             (ts,ts-10*60*1000))
+            self.con.commit()
+    def update_price(self,symbol,price,ts):
         with self.lock:
             rows=self.con.execute("SELECT id,direction,tp,stop FROM signals WHERE status='OPEN' AND symbol=?",(symbol,)).fetchall()
-            completed=[]
-            for id_,side,tp,sl in rows:
-                tp_hit = price>=tp if side=='LONG' else price<=tp
-                sl_hit = price<=sl if side=='LONG' else price>=sl
-                status='TP' if tp_hit else 'STOP' if sl_hit else None
+            finished=[]
+            for id_,direction,tp,sl in rows:
+                status=('TP' if price>=tp else 'STOP' if price<=sl else None) if direction=='LONG' else ('TP' if price<=tp else 'STOP' if price>=sl else None)
                 if status:
-                    self.con.execute('UPDATE signals SET status=?,closed=?,exit_price=? WHERE id=?',
-                                     (status,timestamp,price,id_))
-                    completed.append((id_,status))
-            if completed: self.con.commit()
-        return completed
-
+                    self.con.execute('UPDATE signals SET status=?,closed=?,exit_price=? WHERE id=?',(status,ts,price,id_))
+                    finished.append((id_,status))
+            if finished:self.con.commit()
+            return finished
 
 class Radar:
-    def __init__(self, database=None):
-        self.db=database or Database()
+    def __init__(self,db=None):
+        self.db=db or Database()
         self.lock=threading.RLock()
-        self.states={}
-        self.trades={}
-        self.allowed=set()
-        self.followed=set()
-        self.next_follow=set()
-        self.last_market=0
-        self.last_trade=0
+        self.allowed=set();self.states={};self.trades={};self.followed=set()
+        self.next_follow=set();self.rotation=0;self.candidate_updated=0
+        self.last_market=0;self.last_trade=0;self.last_status=0
         self.notify=queue.Queue(maxsize=500)
-        self.last_status=0
-        self.rotation=0
-        self.candidate_updated=0
-        self.follow_since={}
-
     def bootstrap(self):
-        # Fail closed: no unverified symbols or stale ticker samples.
         self.allowed=universe()
+        for item in api('/fapi/v1/ticker/24hr'):
+            sym=item.get('symbol','')
+            if sym in self.allowed:
+                self.on_price(sym,number(item.get('lastPrice')),number(item.get('quoteVolume')),now_ms())
         LOG.info('Loaded %d active USDT perpetual contracts',len(self.allowed))
-        for item in api_json('/fapi/v1/ticker/24hr'):
-            s=item.get('symbol','')
-            if s in self.allowed:
-                self.on_price(s, safe_num(item.get('lastPrice')), safe_num(item.get('quoteVolume')), now_ms())
-
-    def on_price(self, symbol, price, quote, ts):
-        if symbol not in self.allowed or price <= 0: return
+    def enqueue(self,message,ttl=25,kind='entry'):
+        try:self.notify.put_nowait((message,now_ms(),ttl,kind))
+        except queue.Full:LOG.warning('Telegram queue full; dropped %s',kind)
+    def on_price(self,sym,price,quote,ts):
+        if sym not in self.allowed or price<=0:return
         with self.lock:
-            state=self.states.setdefault(symbol,PriceState())
-            # Reject out-of-order stream updates.
-            if ts < state.updated: return
-            state.price=price; state.quote=quote; state.updated=ts
-            if not state.history or ts-state.history[-1][0] >= 1500:
-                state.history.append((ts,price))
+            p=self.states.setdefault(sym,PriceState())
+            if ts<p.updated:return
+            p.price=price;p.quote=quote;p.updated=ts
+            if not p.history or ts-p.history[-1][0]>=1500:p.history.append((ts,price))
             self.last_market=now_ms()
-        outcomes=self.db.update_price(symbol,price,ts)
-        for id_,status in outcomes:
-            self.enqueue(f'ALPER Radar | Deneme sonucu #{id_}: {symbol} {status} (görülen fiyat {price:.9g})',
-                         now_ms(), ttl=180, kind='result')
-
-    def on_trade(self, item):
-        if item.get('e') != 'aggTrade': return
-        symbol=item.get('s','')
-        ts=int(item.get('T',0)); price=safe_num(item.get('p')); qty=safe_num(item.get('q'))
-        if symbol not in self.allowed or price<=0 or qty<=0 or abs(now_ms()-ts)>5000: return
-        side = -1 if item.get('m') is True else 1 # m=true: buyer was maker => aggressive sell
+        for id_,status in self.db.update_price(sym,price,ts):
+            self.enqueue(f'ALPER V8.2 | SANAL SONUÇ #{id_}: {sym} {status} | gözlenen {price:.9g}',180,'result')
+    def on_trade(self,item):
+        if item.get('e')!='aggTrade':return
+        sym=item.get('s','');ts=int(item.get('T') or 0)
+        px=number(item.get('p'));qty=number(item.get('q'))
+        if sym not in self.allowed or px<=0 or qty<=0 or abs(now_ms()-ts)>5000:return
+        side=-1 if item.get('m') is True else 1
         with self.lock:
-            if symbol not in self.followed: return
-            trade=self.trades.setdefault(symbol,TradeState(started=ts))
-            trade.trades.append((ts,price,price*qty,side))
-            while trade.trades and ts-trade.trades[0][0] > 95000: trade.trades.popleft()
+            if sym not in self.followed:return
+            state=self.trades.setdefault(sym,TradeState(started=ts))
+            state.trades.append((ts,px,px*qty,side))
+            while state.trades and ts-state.trades[0][0]>95000:state.trades.popleft()
             self.last_trade=now_ms()
-            p=self.states.get(symbol)
-            if not p or now_ms()-p.updated>4500: return
-            val=compute_signal(trade.trades,p.price,p.updated,now_ms())
-        if val is None or self.db.recent(symbol,val['direction'],ts): return
-        # Enforce one paper position per symbol, preventing opposing repeated alerts.
+            p=self.states.get(sym)
+            if p is None or now_ms()-p.updated>4500:return
+            snapshot=list(state.trades);price=p.price;updated=p.updated
+        current=now_ms()
+        if self.db.open_exists(sym):return
+        # A fresh WATCH is only a hypothesis: never open a paper position here.
+        watch=analyze(snapshot,price,updated,current,'watch')
+        if watch and not self.db.recent('watches',sym,watch['direction'],current,WATCH_COOLDOWN):
+            self.db.watch(current,sym,watch)
+            self.enqueue(f'👀 ALPER V8.2 | ÖN UYARI (İŞLEM DEĞİL)\n{sym} {watch["direction"]}\n'
+                         f'Gözlenen: {price:.9g} | akış: %{watch["strength"]*100:.0f} | ivme: {watch["burst"]:.1f}x\n'
+                         'Henüz doğrulanmadı. Pozisyon açma sinyali değildir.',25,'watch')
+        confirmed=analyze(snapshot,price,updated,current,'confirm')
+        if not confirmed or self.db.recent('signals',sym,confirmed['direction'],current,COOLDOWN_SECONDS):return
+        # Conservative: require a matching watch (created before this observation) within last 10 minutes.
         with self.db.lock:
-            if self.db.con.execute('SELECT 1 FROM signals WHERE symbol=? AND status="OPEN" LIMIT 1',(symbol,)).fetchone():
-                return
-        # Never emit a late trade observation.
-        if now_ms()-ts > ALERT_TTL*1000: return
-        id_,tp,sl=self.db.insert(ts,symbol,val)
-        price=val['price']
-        text=(f'🔎 ALPER V8 | ERKEN FIRSAT (DENEME)\n{symbol} | {val["direction"]}\n'
-              f'Gözlenen fiyat: {price:.9g}\nÖrnek TP (+1.5%): {tp:.9g}\n'
-              f'Örnek stop (-0.75%): {sl:.9g}\n'
-              f'İşlem akışı baskısı: %{100*val["strength"]:.0f} | hacim ivmesi: {val["burst"]:.1f}x\n'
-              f'Fiyat-yön teyidi: %{val["confirmed_move_pct"]:.2f} (zaten oluşmuş hareket)\n'
-              f'Veri yaşı: {val["age_ms"]/1000:.1f} sn\n'
-              f'İşlem tavsiyesi değildir. Hareketin 3–5 dk önce öngörülmesi garanti değildir.')
-        self.enqueue(text,now_ms(),ttl=ALERT_TTL,kind='entry')
-        LOG.info('EARLY %s %s price=%s burst=%.2f flow=%.2f',symbol,val['direction'],price,val['burst'],val['strength'])
-
+            eligible=self.db.con.execute("SELECT 1 FROM watches WHERE symbol=? AND direction=? AND status='WATCH' AND created<? AND created>=? LIMIT 1",
+                                        (sym,confirmed['direction'],current,current-10*60*1000)).fetchone()
+            if not eligible or self.db.open_exists(sym):return
+            id_,tp,sl=self.db.confirmed(current,sym,confirmed)
+        self.enqueue(f'✅ ALPER V8.2 | ONAYLI SANAL {confirmed["direction"]}\n'
+                     f'{sym} | giriş referansı: {price:.9g}\nTP (+1.5%): {tp:.9g}\n'
+                     f'STOP (-0.75%): {sl:.9g}\nAkış baskısı %{confirmed["strength"]*100:.0f}, '
+                     f'ivme {confirmed["burst"]:.1f}x | fiyat hareketi %{confirmed["move"]:.2f}\n'
+                     f'Kayıt #{id_} | işlem tavsiyesi değildir.',25,'entry')
+        LOG.info('CONFIRMED %s %s #%d',sym,confirmed['direction'],id_)
     def choose_follow(self):
-        """Broad overview every second, detailed trades for changing liquid shortlist.
-        Selection intentionally doesn't pretend to monitor every coin at tick level.
-        """
-        ts=now_ms()
+        t=now_ms()
         with self.lock:
             available=[]
-            for s,p in self.states.items():
-                if p.quote<MIN_QUOTE or ts-p.updated>20000 or len(p.history)<3: continue
-                old=next((v for t,v in reversed(p.history) if ts-t>=30000),None)
-                if old is None or old<=0: continue
-                change=abs(p.price/old-1)*100
-                # Prefer emerging movement but avoid huge late jumps.
-                if change>1.5: continue
-                available.append((s,p.quote,change))
+            for sym,p in self.states.items():
+                if p.quote<MIN_QUOTE or t-p.updated>20000:continue
+                old=next((v for stamp,v in reversed(p.history) if t-stamp>=30000),None)
+                if old is None or old<=0:continue
+                move=abs(p.price/old-1)*100
+                if move>1.5:continue
+                available.append((sym,p.quote,move))
             liquid=sorted(available,key=lambda x:x[1],reverse=True)
             moving=sorted(available,key=lambda x:x[2],reverse=True)
-            n1=FOLLOW_COUNT//2
-            chosen=[x[0] for x in moving[:n1]]
-            # Rotate the liquidity half so different contracts get detailed attention.
-            rest=[x[0] for x in liquid if x[0] not in chosen]
-            if rest:
-                offset=self.rotation%len(rest)
-                chosen += (rest[offset:]+rest[:offset])[:FOLLOW_COUNT-len(chosen)]
-                self.rotation += FOLLOW_COUNT-len(chosen)
-            # Keep subscriptions stable long enough to build two full 45s windows.
-            # Replacing all streams every refresh would repeatedly reset warm-up.
-            retain=[s for s in self.followed if s in {x[0] for x in available}]
+            eligible={x[0] for x in available}
+            movers=[x[0] for x in moving[:FOLLOW_COUNT//2]]
+            retain=sorted((s for s in self.followed if s in eligible),
+                          key=lambda s: next((x[2] for x in available if x[0]==s),0),reverse=True)
             stable=retain[:FOLLOW_COUNT//2]
-            merged=(stable+[s for s in chosen if s not in stable])[:FOLLOW_COUNT]
-            self.next_follow=set(merged)
-            self.candidate_updated=ts
-        LOG.info('Coverage %d market contracts, eligible %d, detailed shortlist %d',
-                 len(self.allowed),len(available),len(self.next_follow))
-
-    def enqueue(self,message, created, ttl=ALERT_TTL,kind='entry'):
-        try: self.notify.put_nowait((message,created,ttl,kind))
-        except queue.Full: LOG.error('Notification queue full; discarded %s',kind)
-
+            rest=[x[0] for x in liquid if x[0] not in stable+movers]
+            offset=self.rotation%len(rest) if rest else 0
+            rotation=(rest[offset:]+rest[:offset]) if rest else []
+            self.rotation+=max(1,FOLLOW_COUNT//2)
+            chosen=list(dict.fromkeys(stable+movers+rotation))[:FOLLOW_COUNT]
+            self.next_follow=set(chosen)
+            self.candidate_updated=t
+        LOG.info('Coverage %d eligible %d detailed %d',len(self.allowed),len(available),len(chosen))
     def notifier(self):
         while not STOP.is_set():
-            try: message,created,ttl,kind=self.notify.get(timeout=1)
-            except queue.Empty: continue
-            if now_ms()-created>ttl*1000:
-                LOG.warning('Dropped expired %s notification',kind); continue
+            try:msg,created,ttl,kind=self.notify.get(timeout=1)
+            except queue.Empty:continue
+            if now_ms()-created>ttl*1000:continue
             if not TOKEN or not CHAT:
-                LOG.info('Telegram not configured; signal logged only: %s',message.splitlines()[0]);continue
-            payload=urllib.parse.urlencode({'chat_id':CHAT,'text':message}).encode()
+                LOG.info('Telegram not configured: %s',msg.splitlines()[0]);continue
+            body=urllib.parse.urlencode({'chat_id':CHAT,'text':msg}).encode()
             for attempt in range(3):
-                if now_ms()-created>ttl*1000: break
+                if now_ms()-created>ttl*1000:break
                 try:
-                    req=urllib.request.Request('https://api.telegram.org/bot'+TOKEN+'/sendMessage',data=payload)
-                    with urllib.request.urlopen(req,timeout=10) as response:
-                        result=json.load(response)
-                    if result.get('ok'): break
-                    raise RuntimeError('Telegram replied ok=false')
+                    request=urllib.request.Request('https://api.telegram.org/bot'+TOKEN+'/sendMessage',data=body)
+                    with urllib.request.urlopen(request,timeout=10) as response:out=json.load(response)
+                    if out.get('ok'):break
+                    raise RuntimeError('Telegram ok=false')
                 except Exception as exc:
-                    LOG.warning('Telegram %s attempt %d failed: %s',kind,attempt+1,exc)
+                    LOG.warning('Telegram %s failed: %s',kind,exc)
                     STOP.wait(min(2**attempt,5))
-
-    def stream_market(self):
+    def market_worker(self):
         backoff=2
         while not STOP.is_set():
             sock=None
             try:
-                sock=websocket.create_connection(WS+'/!miniTicker@arr',timeout=15,enable_multithread=True)
-                sock.settimeout(15);LOG.info('MARKET websocket connected')
-                backoff=2
+                sock=websocket.create_connection(WS+'/!miniTicker@arr',timeout=15)
+                sock.settimeout(15);backoff=2
+                LOG.info('MARKET websocket connected')
                 while not STOP.is_set():
-                    raw=sock.recv()
-                    arr=json.loads(raw)
-                    if isinstance(arr,dict): arr=arr.get('data',[])
-                    if not isinstance(arr,list): continue
-                    current=now_ms()
-                    for i in arr:
-                        if not isinstance(i,dict) or str(i.get('st',1))!='1': continue
-                        s=i.get('s','')
-                        # E is exchange event time; skip delayed/out-of-order events.
-                        event=int(i.get('E',current))
-                        if abs(current-event)>10000: continue
-                        self.on_price(s,safe_num(i.get('c')),safe_num(i.get('q')),event)
-            except Exception as exc:
-                LOG.warning('MARKET disconnected: %s',exc)
+                    raw=json.loads(sock.recv())
+                    items=raw.get('data',[]) if isinstance(raw,dict) else raw
+                    if not isinstance(items,list):continue
+                    received=now_ms()
+                    for item in items:
+                        if not isinstance(item,dict) or str(item.get('st','1'))!='1':continue
+                        event=int(item.get('E',received))
+                        if abs(received-event)>10000:continue
+                        self.on_price(item.get('s',''),number(item.get('c')),number(item.get('q')),event)
+            except Exception as exc:LOG.warning('MARKET disconnected: %s',exc)
             finally:
                 if sock:
                     try:sock.close()
                     except Exception:pass
             STOP.wait(backoff+random.random());backoff=min(60,backoff*2)
-
-    def stream_trades(self):
+    def trade_worker(self):
         backoff=2
         while not STOP.is_set():
             sock=None
-            with self.lock: target=set(self.next_follow)
-            if not target:
-                STOP.wait(3);continue
+            with self.lock:target=set(self.next_follow)
+            if not target:STOP.wait(2);continue
             try:
-                sock=websocket.create_connection(WS,timeout=15,enable_multithread=True)
+                sock=websocket.create_connection(WS,timeout=15)
                 sock.settimeout(10)
-                streams=[f'{s.lower()}@aggTrade' for s in sorted(target)]
-                sock.send(json.dumps({'method':'SUBSCRIBE','params':streams,'id':'radar-trades'}))
+                sock.send(json.dumps({'method':'SUBSCRIBE','params':[s.lower()+'@aggTrade' for s in sorted(target)],'id':'radar-v82'}))
                 with self.lock:
                     self.followed=set(target)
                     self.trades={s:self.trades.get(s,TradeState()) for s in target}
-                LOG.info('TRADES subscribed=%d',len(target));backoff=2
-                connected=time.monotonic()
+                backoff=2;connected=time.monotonic()
+                LOG.info('TRADES subscribed %d',len(target))
                 while not STOP.is_set():
-                    with self.lock: changed= self.next_follow != target
-                    if changed and time.monotonic()-connected>10: break
-                    try: item=json.loads(sock.recv())
-                    except websocket.WebSocketTimeoutException: continue
-                    if isinstance(item,dict):
-                        self.on_trade(item.get('data',item))
+                    with self.lock:changed=target!=self.next_follow
+                    if changed and time.monotonic()-connected>10:break
+                    try:item=json.loads(sock.recv())
+                    except websocket.WebSocketTimeoutException:continue
+                    if isinstance(item,dict):self.on_trade(item.get('data',item))
             except Exception as exc:
                 LOG.warning('TRADES disconnected: %s',exc)
                 STOP.wait(backoff+random.random());backoff=min(60,backoff*2)
@@ -392,75 +343,65 @@ class Radar:
                 if sock:
                     try:sock.close()
                     except Exception:pass
-
     def run(self):
         self.bootstrap()
-        self.enqueue(f'ALPER Radar V8.1 başladı | {len(self.allowed)} USDT perpetual | DENEME, emir yok',now_ms(),120,'startup')
-        for fn in (self.notifier,self.stream_market,self.stream_trades):
-            threading.Thread(target=fn,daemon=True,name=fn.__name__).start()
+        self.enqueue(f'ALPER Radar V8.2 başladı | {len(self.allowed)} USDT perpetual | yalnızca sanal takip',120,'startup')
+        for worker in (self.notifier,self.market_worker,self.trade_worker):
+            threading.Thread(target=worker,daemon=True,name=worker.__name__).start()
         while not STOP.wait(5):
             t=now_ms()
-            if t-self.candidate_updated>REFRESH*1000:self.choose_follow()
+            if t-self.candidate_updated>REFRESH*1000 or (not self.next_follow and t-self.candidate_updated>15000):
+                self.choose_follow()
             if t-self.last_status>60000:
-                LOG.info('HEALTH market_age=%.1fs trade_age=%.1fs followed=%d queued=%d',
+                self.db.expire_watches(t)
+                LOG.info('HEALTH market_age=%.1fs trade_age=%.1fs followed=%d queue=%d',
                          (t-self.last_market)/1000 if self.last_market else -1,
                          (t-self.last_trade)/1000 if self.last_trade else -1,
                          len(self.followed),self.notify.qsize())
                 self.last_status=t
-            if self.last_market and t-self.last_market>90000:
-                LOG.error('Market feed stale >90s; watchdog will restart process')
-                # Stream worker reconnects itself. Do not spawn duplicate threads here.
-
 
 def self_test():
     import tempfile
-    # These tests exercise core logic, not live Binance uptime or predictive profitability.
-    with tempfile.TemporaryDirectory() as d:
-        db=Database(str(Path(d)/'test.db'))
-        rd=Radar(db);rd.allowed={'TESTUSDT'}
-        t=now_ms();p=100.0
-        rd.on_price('TESTUSDT',p,20000000,t)
+    original_flow = MIN_FLOW_USDT
+    with tempfile.TemporaryDirectory() as temp:
+        db=Database(str(Path(temp)/'test.sqlite3'))
+        t=now_ms()
+        # 90-second directional buying with volume acceleration and persistent participation.
         trades=[]
         for i in range(100):
-            ts=t-89000+i*890
-            q=300 if i<50 else 900
-            px = 100.0 + 0.12*i/99
-            trades.append((ts,px,q,1 if i%10!=0 else -1))
-        result=compute_signal(trades,100.12,t,t)
-        assert result and result['direction']=='LONG',result
-        assert compute_signal(trades,100.12,t-8000,t) is None
-        assert compute_signal(trades,99.90,t,t) is None  # buying into down-move must not trigger LONG
-        assert compute_signal(trades,102.0,t,t) is None
-        id_,tp,sl=db.insert(t,'TESTUSDT',result)
-        assert db.recent('TESTUSDT','LONG',t)
-        assert db.update_price('TESTUSDT',tp+.001,t+1000)[0]==(id_,'TP')
-        assert not db.update_price('TESTUSDT',sl-.001,t+2000)
-        short_trades=[(ts,200-2*(px-100),q,-side) for ts,px,q,side in trades]
-        short=compute_signal(short_trades,199.76,t,t)
-        assert short and short['direction']=='SHORT',short
-        assert compute_signal(short_trades,200.10,t,t) is None
-        rd.on_price('TESTUSDT',101.0,20000000,t+3000)
-        assert len(rd.states)==1
-    print('PASS: bidirectional price confirmation, countertrend guard, freshness, chase filter, cooldown, SQLite TP, duplicate closure')
-
+            stamp=t-89_000+i*890
+            px=100+.12*i/99
+            trades.append((stamp,px,300 if i<50 else 900,1 if i%10 else -1))
+        value=analyze(trades,100.12,t,t,'confirm')
+        assert value and value['direction']=='LONG',value
+        assert analyze(trades,100.12,t-8000,t,'confirm') is None
+        assert analyze(trades,99.9,t,t,'confirm') is None
+        short=[(stamp,200-2*(price-100),flow,-side) for stamp,price,flow,side in trades]
+        val=analyze(short,199.76,t,t,'confirm')
+        assert val and val['direction']=='SHORT',val
+        db.watch(t-1000,'TESTUSDT',value)
+        id_,tp,sl=db.confirmed(t,'TESTUSDT',value)
+        assert db.recent('signals','TESTUSDT','LONG',t,COOLDOWN_SECONDS)
+        assert db.update_price('TESTUSDT',tp+.01,t+1000)==[(id_,'TP')]
+        assert db.update_price('TESTUSDT',sl-.01,t+2000)==[]
+        assert db.con.execute("SELECT status FROM watches LIMIT 1").fetchone()[0]=='CONFIRMED'
+    print('PASS: LONG, SHORT, stale rejection, countertrend rejection, watch confirmation, cooldown, TP closure')
 
 def main():
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
     if '--self-test' in sys.argv:return self_test()
-    if websocket is None:sys.exit('Missing dependency: pip install websocket-client==1.9.0')
-    # Linux Render single-process guard; Render services across separate hosts require a single deployment.
-    lock_path=Path(os.getenv('RADAR_LOCK','/tmp/alper_radar_v8.lock'))
+    if websocket is None:sys.exit('Install dependency: pip install websocket-client==1.9.0')
+    lock_path=Path(os.getenv('RADAR_LOCK','/tmp/alper_radar_v82.lock'))
     lock_path.parent.mkdir(parents=True,exist_ok=True)
-    lock=lock_path.open('w')
-    try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    except BlockingIOError:sys.exit('Another radar process is already active on this host')
-    def terminate(_signum,_frame):STOP.set()
-    signal.signal(signal.SIGTERM,terminate)
-    signal.signal(signal.SIGINT,terminate)
-    while not STOP.is_set():
-        try:Radar().run()
-        except Exception:
-            LOG.exception('Radar encountered failure; restart in 30 seconds')
-            STOP.wait(30)
+    with lock_path.open('w') as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:sys.exit('Another V8.2 radar on this host')
+        def close(signum,frame):STOP.set()
+        signal.signal(signal.SIGTERM,close);signal.signal(signal.SIGINT,close)
+        while not STOP.is_set():
+            try:Radar().run()
+            except Exception:
+                LOG.exception('Radar failure, restarting in 30s')
+                STOP.wait(30)
 
 if __name__=='__main__':main()
