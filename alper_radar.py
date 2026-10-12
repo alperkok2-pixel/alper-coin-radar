@@ -1,8 +1,8 @@
-"""ALPER Radar V6.3 — Binance USD-M futures PAPER signal radar.
+"""ALPER Radar V6.4 — Binance USD-M futures PAPER signal radar.
 Python 3.11+; standard library only. NEVER submits orders.
 Start: python -u alper_radar.py   Test: python alper_radar.py --self-test
 Telegram secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (Render environment).
-Optional: MIN_TARGET_PCT=5, MIN_VOLUME_RATIO=1.3, DETAIL_BATCH=12,
+Optional: TP1_PCT=1.5, TP2_PCT=2.5, TP3_PCT=5, MIN_VOLUME_RATIO=1.3, DETAIL_BATCH=12,
 SCAN_SECONDS=60, REQUEST_GAP_SECONDS=2.5, MAX_STOP_PCT=1.5,
 MIN_24H_VOLUME=30000000, SIGNAL_COOLDOWN_HOURS=12, MIN_ADX=18, MIN_SCORE=4.
 Backtest on recent closed data: python alper_radar.py --backtest
@@ -23,7 +23,8 @@ from pathlib import Path
 BASE = "https://fapi.binance.com"
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TARGET_PCT = float(os.getenv("MIN_TARGET_PCT", "5"))
+TP_LEVELS = tuple(float(os.getenv(f"TP{i}_PCT", default)) for i, default in enumerate(("1.5", "2.5", "5"), 1))
+TARGET_PCT = TP_LEVELS[-1]  # The backtest retains its single terminal-TP3 outcome metric.
 VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.3"))
 DETAIL_BATCH = max(1, min(30, int(os.getenv("DETAIL_BATCH", "12"))))
 MONITOR_BATCH = max(1, min(12, int(os.getenv("MONITOR_BATCH", "3"))))
@@ -128,6 +129,14 @@ def db_connect():
     columns = {r[1] for r in con.execute("PRAGMA table_info(trades)")}
     if "strategy" not in columns:
         con.execute("ALTER TABLE trades ADD COLUMN strategy TEXT NOT NULL DEFAULT 'BREAKOUT'")
+    # Keep legacy V6.3 trades on their original single-target tracking plan.
+    for col, spec in (("tp_plan_version", "INTEGER NOT NULL DEFAULT 0"),
+                      ("tp1_price", "REAL"), ("tp2_price", "REAL"),
+                      ("tp1_hit", "INTEGER NOT NULL DEFAULT 0"),
+                      ("tp2_hit", "INTEGER NOT NULL DEFAULT 0"),
+                      ("last_checked_ms", "INTEGER")):
+        if col not in columns:
+            con.execute(f"ALTER TABLE trades ADD COLUMN {col} {spec}")
     con.execute("CREATE TABLE IF NOT EXISTS radar_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     con.commit()
     return con
@@ -251,7 +260,7 @@ def evaluate(s5, s15, s1h):
     if not a5 or not a1h or strength is None or hist is None:
         return None
     # Heuristic volatility feasibility filter; NOT an implied price forecast.
-    if a1h/ch[-1]*100*8 < TARGET_PCT:
+    if a1h/ch[-1]*100*8 < TP_LEVELS[0]:
         return None
     prior_high = max(float(x[2]) for x in s5[-21:-1])
     prior_low = min(float(x[3]) for x in s5[-21:-1])
@@ -280,10 +289,12 @@ def evaluate(s5, s15, s1h):
     if strength < MIN_ADX or score < MIN_SCORE:
         return None
     stop_pct = min(STOP_LIMIT, max(0.5,(a5/current)*100*2))
-    if stop_pct <= 0 or TARGET_PCT / stop_pct < 2:
+    if stop_pct <= 0 or TP_LEVELS[1] / stop_pct < 1.5:
         return None
     return {"side":side,"strategy":strategy,"score":score,"adx":strength,
-        "entry":current,"target":current*(1+sign*TARGET_PCT/100),
+        "entry":current,"target":current*(1+sign*TP_LEVELS[2]/100),
+        "tp1":current*(1+sign*TP_LEVELS[0]/100),
+        "tp2":current*(1+sign*TP_LEVELS[1]/100),
         "stop":current*(1-sign*stop_pct/100), "close_ms":int(s5[-1][6]),
         "volume_ratio":vol_now/vol_avg,"rsi":r,"stop_pct":stop_pct}
 
@@ -342,56 +353,81 @@ def universe():
     return sorted(valid)
 
 
+def advance_targets(side, hi, lo, levels, stop, already=(False, False)):
+    """Closed-candle milestone tracking; conservative on same-candle stop/target order."""
+    hit = lambda price: hi >= price if side == "LONG" else lo <= price
+    stop_hit = lo <= stop if side == "LONG" else hi >= stop
+    milestones = tuple(hit(price) for price in levels)
+    if stop_hit and any(new and not old for new, old in zip(milestones[:2], already)):
+        return tuple(already), "AMBIGUOUS", ()
+    if stop_hit and milestones[2]:
+        return tuple(already), "AMBIGUOUS", ()
+    if stop_hit:
+        return tuple(already), "STOP", ()
+    changed = tuple(i for i in (0, 1) if milestones[i] and not already[i])
+    if milestones[2]:
+        return (True, True), "TP3", changed + (2,)
+    return tuple(old or hit for old, hit in zip(already, milestones[:2])), None, changed
+
+
 def monitor(con):
-    # Track by candle highs/lows after signal bar, never unfinished candles.
-    active = con.execute("SELECT id,symbol,side,entry,target,stop,bar_close_ms,opened FROM trades WHERE status='OPEN'").fetchall()
-    # Bound monitoring load so a backlog cannot block scanning indefinitely.
+    active = con.execute("""SELECT id,symbol,side,entry,target,stop,bar_close_ms,opened,
+                       tp_plan_version,tp1_price,tp2_price,tp1_hit,tp2_hit,last_checked_ms
+                       FROM trades WHERE status='OPEN' ORDER BY id""").fetchall()
     if active:
         rec = con.execute("SELECT value FROM radar_state WHERE key='monitor_cursor'").fetchone()
         offset = int(rec[0]) % len(active) if rec else 0
         active = (active[offset:] + active[:offset])[:MONITOR_BATCH]
-        con.execute("INSERT OR REPLACE INTO radar_state(key,value) VALUES('monitor_cursor',?)", (str((offset+len(active)) % max(1, len(con.execute("SELECT 1 FROM trades WHERE status='OPEN'").fetchall()))),))
+        con.execute("INSERT OR REPLACE INTO radar_state(key,value) VALUES('monitor_cursor',?)",
+                    (str((offset+len(active)) % max(1,con.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0])),))
         con.commit()
     log(f"Monitoring paper signals: {len(active)} selected")
-    for trade_id, symbol, side, entry, target, stop, bar_ms, opened in active:
+    for trade_id, symbol, side, entry, target, stop, bar_ms, opened, plan, tp1, tp2, h1, h2, last_seen in active:
         try:
             now = int(time.time())
-            if now - opened > 48 * 3600:
-                con.execute("UPDATE trades SET status='EXPIRED',closed=? WHERE id=?", (now, trade_id))
-                con.commit()
-                notify(f"⏳ {symbol} {side} | Paper signal expired after 48h, neither target nor stop confirmed")
-                continue
-            # Limit 576 5m candles = 48h. Higher weight; tracking is bounded to last 100 candles,
-            # so older candle gaps will be explicitly reported rather than fabricated.
+            # Check available candles BEFORE expiring, to avoid losing a prior target hit.
             rows = candles(symbol, "5m", 100)
-            newer = [x for x in rows if int(x[0]) > bar_ms]
-            if not newer:
-                continue
-            # If the first returned candle skips part of the tracking period, outcome is unknown.
-            if int(newer[0][0]) > bar_ms + 300001:
+            cursor = last_seen if last_seen is not None else bar_ms
+            newer = [x for x in rows if int(x[0]) > cursor]
+            if newer and int(newer[0][0]) > cursor + 300001:
                 con.execute("UPDATE trades SET status='UNKNOWN_GAP',closed=? WHERE id=?", (now, trade_id))
                 con.commit()
-                notify(f"⚠️ {symbol} {side} | Insufficient candles for continuous tracking; result unknown")
+                notify(f"⚠️ {symbol} {side} | Tracking candle gap; outcome unknown")
                 continue
-            status = None
+            state = None
+            milestones = []
             for x in newer:
                 hi, lo = float(x[2]), float(x[3])
-                tp = hi >= target if side == "LONG" else lo <= target
-                sl = lo <= stop if side == "LONG" else hi >= stop
-                if tp and sl:
-                    status = "AMBIGUOUS"  # sequence within a candle unknown
-                elif tp:
-                    status = "TARGET"
-                elif sl:
-                    status = "STOP"
-                if status:
-                    break
-            if status:
-                con.execute("UPDATE trades SET status=?,closed=? WHERE id=?", (status, now, trade_id))
+                if plan == 1:
+                    flags, outcome, reached = advance_targets(side, hi, lo, (tp1,tp2,target), stop, (bool(h1),bool(h2)))
+                    h1, h2 = map(int, flags)
+                    milestones.extend(reached)
+                    state = outcome
+                else:
+                    tp = hi >= target if side == "LONG" else lo <= target
+                    sl = lo <= stop if side == "LONG" else hi >= stop
+                    state = "AMBIGUOUS" if tp and sl else ("TARGET" if tp else "STOP" if sl else None)
+                # Persist candle cursor and reached milestones together.
+                con.execute("UPDATE trades SET last_checked_ms=?, tp1_hit=?, tp2_hit=? WHERE id=?",
+                            (int(x[0]),h1,h2,trade_id))
                 con.commit()
-                notify(f"📊 ALPER Paper Tracker | {symbol} {side}\nOutcome: {status}\nEntry(reference): {entry:.9g}\nTarget: {target:.9g} | Stop: {stop:.9g}\nNot an executed trade")
+                for n in milestones:
+                    pct = TP_LEVELS[n]
+                    notify(f"🎯 {symbol} {side} PAPER TP{n+1} (+{pct:g}% price) reached | Reference entry {entry:.9g}")
+                milestones = []
+                if state:
+                    break
+            if not state and now - opened > 48*3600:
+                state = "EXPIRED"
+            if state:
+                con.execute("UPDATE trades SET status=?,closed=? WHERE id=?", (state, now, trade_id))
+                con.commit()
+                msg = f"📊 ALPER Paper Tracker | {symbol} {side}\nOutcome: {state}\nEntry: {entry:.9g} | Stop: {stop:.9g}"
+                if plan == 1:
+                    msg += f"\nTP1 reached: {bool(h1)} | TP2 reached: {bool(h2)} | TP3 reached: {state == 'TP3'}"
+                notify(msg + "\nNot an executed trade; same-bar order may be unknown")
         except Exception as exc:
-            log(f"Monitor error {symbol}: {exc}")
+            log(f"Monitor error {symbol}: {type(exc).__name__} {exc}")
 
 
 def scan(con, symbols, cache=None):
@@ -421,17 +457,19 @@ def scan(con, symbols, cache=None):
                                     (symbol, side, found["close_ms"])).fetchone()
             if duplicate:
                 continue
-            msg = (f"🚨 ALPER Radar V6.3 | PAPER {side}\n{symbol}\n"
+            msg = (f"🚨 ALPER Radar V6.4 | PAPER {side}\n{symbol}\n"
                    f"Reference entry: {found['entry']:.9g}\n"
-                   f"🎯 Target (+{TARGET_PCT:g}% price move): {found['target']:.9g}\n"
+                   f"🎯 TP1 (+{TP_LEVELS[0]:g}%): {found['tp1']:.9g}\n"
+                   f"🎯 TP2 (+{TP_LEVELS[1]:g}%): {found['tp2']:.9g}\n"
+                   f"🎯 TP3 (+{TP_LEVELS[2]:g}%): {found['target']:.9g}\n"
                    f"🛑 Stop ({found['stop_pct']:.2f}% price move): {found['stop']:.9g}\n"
                    f"{found['strategy']} | score {found['score']}/6 | ADX {found['adx']:.1f}\n"
                    f"15m + 1h trend | Volume {found['volume_ratio']:.2f}x | RSI {found['rsi']:.1f}\n"
                    "Closed candles; not a live fill or profit guarantee")
             # Store before sending so transient Telegram errors never spam repeated signals.
-            con.execute("INSERT INTO trades(symbol,side,bar_close_ms,entry,target,stop,opened,status,strategy) "
-                        "VALUES(?,?,?,?,?,?,?,'OPEN',?)",
-                        (symbol, side, found["close_ms"], found["entry"], found["target"], found["stop"], now, found["strategy"]))
+            con.execute("INSERT INTO trades(symbol,side,bar_close_ms,entry,target,stop,opened,status,strategy,tp_plan_version,tp1_price,tp2_price,last_checked_ms) "
+                        "VALUES(?,?,?,?,?,?,?,'OPEN',?,1,?,?,?)",
+                        (symbol, side, found["close_ms"], found["entry"], found["target"], found["stop"], now, found["strategy"],found["tp1"],found["tp2"],found["close_ms"]))
             con.commit()
             notify(msg)
             sent += 1
@@ -462,7 +500,12 @@ def self_test():
     batch, cursor = pick_batch(syms, ["S15", "S16", "S17"], 0, 0)
     assert len(batch) == len(set(batch)) == DETAIL_BATCH
     assert "S15" in batch and cursor > 0
-    print("SELF-TEST PASS: indicators / ranked market / unique rotating batch")
+    assert advance_targets("LONG", 101.6, 100.3, (101.5,102.5,105),99, (False,False)) == ((True,False),None,(0,))
+    assert advance_targets("SHORT", 99.5, 97.4, (98.5,97.5,95),101, (False,False)) == ((True,True),None,(0,1))
+    assert advance_targets("LONG", 105.2, 101.8, (101.5,102.5,105),99, (True,False)) == ((True,True),"TP3",(1,2))
+    assert advance_targets("LONG", 102, 98, (101.5,102.5,105),99, (False,False))[1] == "AMBIGUOUS"
+    assert advance_targets("LONG", 100, 98, (101.5,102.5,105),99, (True,False))[1] == "STOP"
+    print("SELF-TEST PASS: indicators / ranked market / rotating batch / three targets")
 
 
 def rank_market(tickers, valid_symbols):
@@ -541,11 +584,11 @@ def main():
     if "--backtest" in sys.argv:
         backtest()
         return
-    if not (0.2 <= TARGET_PCT <= 30 and 0.3 <= STOP_LIMIT <= 5):
-        raise ValueError("Check MIN_TARGET_PCT and MAX_STOP_PCT")
+    if not (0.2 <= TP_LEVELS[0] < TP_LEVELS[1] < TP_LEVELS[2] <= 30 and 0.3 <= STOP_LIMIT <= 5):
+        raise ValueError("Check TP1_PCT/TP2_PCT/TP3_PCT and MAX_STOP_PCT")
     con = db_connect()
-    log("ALPER Radar V6.3 PAPER started; order execution DISABLED")
-    notify(f"✅ ALPER Radar V6.3 started (PAPER only)\nMinimum target {TARGET_PCT:g}% (price, not leverage)\nAll USDT perpetuals bulk-screened; detailed analysis is prioritized and rotating")
+    log("ALPER Radar V6.4 PAPER started; order execution DISABLED")
+    notify(f"✅ ALPER Radar V6.4 started (PAPER only)\nPrice targets TP1={TP_LEVELS[0]:g}%, TP2={TP_LEVELS[1]:g}%, TP3={TP_LEVELS[2]:g}% (not leverage)\nAll USDT perpetuals bulk-screened; detailed analysis is prioritized and rotating")
     cycle = 0
     symbols, hot = [], []
     cache = {}
@@ -586,7 +629,7 @@ def main():
                 open_count = con.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
                 stats = con.execute("SELECT strategy,status,COUNT(*) FROM trades GROUP BY strategy,status").fetchall()
                 overview = "; ".join(f"{a}:{b}={c}" for a,b,c in stats)[:600] or "no trades yet"
-                notify(f"💚 ALPER Radar V6.3 health | {len(symbols)} bulk-screened | {len(batch)} detailed | {found} signals | {open_count} open paper signals\n{overview}")
+                notify(f"💚 ALPER Radar V6.4 health | {len(symbols)} bulk-screened | {len(batch)} detailed | {found} signals | {open_count} open paper signals\n{overview}")
             cycle += 1
         except KeyboardInterrupt:
             raise
