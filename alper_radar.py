@@ -1,4 +1,4 @@
-"""ALPER Radar V8.2: PAPER-ONLY Binance USDT perpetual early watch + confirmation.
+"""ALPER Radar V8.2 QUIET: PAPER-ONLY Binance USDT perpetual early watch + confirmation.
 Python 3.11+, pip install websocket-client==1.9.0
 Run: python -u alper_radar.py ; test: python alper_radar.py --self-test
 Environment: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, FOLLOW_COUNT=20,
@@ -196,6 +196,11 @@ class Radar:
                 self.on_price(sym,number(item.get('lastPrice')),number(item.get('quoteVolume')),now_ms())
         LOG.info('Loaded %d active USDT perpetual contracts',len(self.allowed))
     def enqueue(self,message,ttl=25,kind='entry'):
+        # Quiet Telegram mode: watch hypotheses and startup stay in the
+        # internal database/logs; only confirmed paper entries and TP/STOP
+        # outcomes reach Telegram. The watch/confirmation logic is unchanged.
+        if kind not in ('entry', 'result'):
+            return
         try:self.notify.put_nowait((message,now_ms(),ttl,kind))
         except queue.Full:LOG.warning('Telegram queue full; dropped %s',kind)
     def on_price(self,sym,price,quote,ts):
@@ -229,6 +234,7 @@ class Radar:
         watch=analyze(snapshot,price,updated,current,'watch')
         if watch and not self.db.recent('watches',sym,watch['direction'],current,WATCH_COOLDOWN):
             self.db.watch(current,sym,watch)
+            LOG.info('WATCH %s %s recorded (Telegram muted)',sym,watch['direction'])
             self.enqueue(f'👀 ALPER V8.2 | ÖN UYARI (İŞLEM DEĞİL)\n{sym} {watch["direction"]}\n'
                          f'Gözlenen: {price:.9g} | akış: %{watch["strength"]*100:.0f} | ivme: {watch["burst"]:.1f}x\n'
                          'Henüz doğrulanmadı. Pozisyon açma sinyali değildir.',25,'watch')
@@ -385,7 +391,14 @@ def self_test():
         assert db.update_price('TESTUSDT',tp+.01,t+1000)==[(id_,'TP')]
         assert db.update_price('TESTUSDT',sl-.01,t+2000)==[]
         assert db.con.execute("SELECT status FROM watches LIMIT 1").fetchone()[0]=='CONFIRMED'
-    print('PASS: LONG, SHORT, stale rejection, countertrend rejection, watch confirmation, cooldown, TP closure')
+        radar=Radar(db)
+        radar.enqueue('PREVIEW',kind='watch')
+        radar.enqueue('START',kind='startup')
+        assert radar.notify.qsize()==0, 'watch and startup must not reach Telegram'
+        radar.enqueue('CONFIRM',kind='entry')
+        radar.enqueue('TP',kind='result')
+        assert [radar.notify.get_nowait()[0] for _ in range(2)]==['CONFIRM','TP']
+    print('PASS: LONG, SHORT, stale rejection, countertrend rejection, watch confirmation, cooldown, TP closure, Telegram quiet filter')
 
 def main():
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
