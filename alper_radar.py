@@ -1,8 +1,8 @@
-"""ALPER Radar V6 — Binance USD-M futures PAPER signal radar.
+"""ALPER Radar V6.1 — Binance USD-M futures PAPER signal radar.
 Python 3.11+; standard library only. NEVER submits orders.
 Start: python -u alper_radar.py   Test: python alper_radar.py --self-test
 Telegram secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (Render environment).
-Optional: MIN_TARGET_PCT=5, MIN_VOLUME_RATIO=1.3, MAX_SYMBOLS=18,
+Optional: MIN_TARGET_PCT=5, MIN_VOLUME_RATIO=1.3, BATCH_SYMBOLS=16,
 SCAN_SECONDS=300, REQUEST_GAP_SECONDS=1.5, MAX_STOP_PCT=1.5,
 MIN_24H_VOLUME=30000000, SIGNAL_COOLDOWN_HOURS=12, MIN_ADX=18, MIN_SCORE=4.
 Backtest on recent closed data: python alper_radar.py --backtest
@@ -25,9 +25,11 @@ TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TARGET_PCT = float(os.getenv("MIN_TARGET_PCT", "5"))
 VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.3"))
-MAX_SYMBOLS = max(1, min(40, int(os.getenv("MAX_SYMBOLS", "18"))))
+BATCH_SYMBOLS = max(1, min(40, int(os.getenv("BATCH_SYMBOLS", "16"))))
+WEIGHT_SOFT_LIMIT = max(100, int(os.getenv("WEIGHT_SOFT_LIMIT", "800")))
+UNIVERSE_REFRESH_SECONDS = max(3600, int(os.getenv("UNIVERSE_REFRESH_SECONDS", "21600")))
 SCAN_SECONDS = max(300, int(os.getenv("SCAN_SECONDS", "300")))
-REQUEST_GAP = max(1.2, float(os.getenv("REQUEST_GAP_SECONDS", "1.5")))
+REQUEST_GAP = max(2.0, float(os.getenv("REQUEST_GAP_SECONDS", "2.5")))
 STOP_LIMIT = float(os.getenv("MAX_STOP_PCT", "1.5"))
 MIN_TURNOVER = float(os.getenv("MIN_24H_VOLUME", "30000000"))
 COOLDOWN = float(os.getenv("SIGNAL_COOLDOWN_HOURS", "12")) * 3600
@@ -39,6 +41,8 @@ BACKTEST_SYMBOLS = [s.strip().upper() for s in os.getenv("BACKTEST_SYMBOLS", "BT
 
 _last_api_call = 0.0
 _pause_until = 0.0
+_used_weight = 0
+_weight_seen_at = 0.0
 
 
 def log(s):
@@ -46,7 +50,7 @@ def log(s):
 
 
 def fetch(base, path, params=None, attempts=3):
-    global _last_api_call, _pause_until
+    global _last_api_call, _pause_until, _used_weight, _weight_seen_at
     url = base + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -54,6 +58,8 @@ def fetch(base, path, params=None, attempts=3):
         delay = max(0, _pause_until - time.monotonic())
         if base == BASE:
             delay = max(delay, REQUEST_GAP - (time.monotonic() - _last_api_call))
+            if _used_weight >= WEIGHT_SOFT_LIMIT and time.monotonic() - _weight_seen_at < 62:
+                delay = max(delay, 65 - (time.monotonic() - _weight_seen_at))
         if delay:
             time.sleep(delay)
         if base == BASE:
@@ -61,14 +67,19 @@ def fetch(base, path, params=None, attempts=3):
         try:
             request = urllib.request.Request(url, headers={"User-Agent": "ALPER-Radar-Paper/6.0"})
             with urllib.request.urlopen(request, timeout=18) as response:
+                if base == BASE:
+                    raw_weight = response.headers.get("X-MBX-USED-WEIGHT-1M")
+                    if raw_weight is not None:
+                        _used_weight = int(raw_weight)
+                        _weight_seen_at = time.monotonic()
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             if exc.code in (418, 429):
-                raw = exc.headers.get("Retry-After", "60")
+                raw = exc.headers.get("Retry-After", "180")
                 try:
-                    retry = max(60, min(3600, int(raw)))
+                    retry = max(180, min(7200, int(raw)))
                 except (TypeError, ValueError):
-                    retry = 60
+                    retry = 180
                 _pause_until = time.monotonic() + retry + 5
                 log(f"Binance HTTP {exc.code}: {retry+5}s pause")
                 # Avoid repeatedly hitting a blocked shared IP.
@@ -113,6 +124,7 @@ def db_connect():
     columns = {r[1] for r in con.execute("PRAGMA table_info(trades)")}
     if "strategy" not in columns:
         con.execute("ALTER TABLE trades ADD COLUMN strategy TEXT NOT NULL DEFAULT 'BREAKOUT'")
+    con.execute("CREATE TABLE IF NOT EXISTS radar_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     con.commit()
     return con
 
@@ -321,16 +333,15 @@ def universe():
     valid = {x["symbol"] for x in exchange["symbols"]
              if x.get("status") == "TRADING" and x.get("contractType") == "PERPETUAL"
              and x.get("quoteAsset") == "USDT"}
-    ticks = fetch(BASE, "/fapi/v1/ticker/24hr")
-    usable = [x for x in ticks if x.get("symbol") in valid
-              and float(x.get("quoteVolume", 0)) >= MIN_TURNOVER]
-    usable.sort(key=lambda t: float(t.get("quoteVolume", 0)), reverse=True)
-    return [x["symbol"] for x in usable[:MAX_SYMBOLS]]
+    # Include EVERY currently trading USDT-margined perpetual, not just top-volume contracts.
+    # Deterministic order keeps rotation predictable after a restart.
+    return sorted(valid)
 
 
 def monitor(con):
     # Track by candle highs/lows after signal bar, never unfinished candles.
     active = con.execute("SELECT id,symbol,side,entry,target,stop,bar_close_ms,opened FROM trades WHERE status='OPEN'").fetchall()
+    # Monitoring remains independent of universe batching.
     for trade_id, symbol, side, entry, target, stop, bar_ms, opened in active:
         try:
             now = int(time.time())
@@ -438,24 +449,38 @@ def main():
     if not (0.2 <= TARGET_PCT <= 30 and 0.3 <= STOP_LIMIT <= 5):
         raise ValueError("Check MIN_TARGET_PCT and MAX_STOP_PCT")
     con = db_connect()
-    log("ALPER Radar V6 PAPER started; order execution DISABLED")
-    notify(f"✅ ALPER Radar V6 started (PAPER only)\nMinimum target {TARGET_PCT:g}% (coin price, not leverage)\nLONG + SHORT | 5m/15m/1h | max {MAX_SYMBOLS} symbols")
+    log("ALPER Radar V6.1 PAPER started; order execution DISABLED")
+    notify(f"✅ ALPER Radar V6.1 started (PAPER only)\nMinimum target {TARGET_PCT:g}% (coin price, not leverage)\nLONG + SHORT | 5m/15m/1h | ALL active USDT perpetual symbols (rotating)")
     cycle = 0
     symbols = []
+    saved_cursor = con.execute("SELECT value FROM radar_state WHERE key='cursor'").fetchone()
+    cursor = int(saved_cursor[0]) if saved_cursor else 0
+    last_universe_refresh = 0.0
     while True:
         begun = time.monotonic()
         try:
-            if not symbols or cycle % 12 == 0:
+            if not symbols or time.monotonic() - last_universe_refresh >= UNIVERSE_REFRESH_SECONDS:
                 symbols = universe()
-                log(f"Universe: {len(symbols)} symbols; {', '.join(symbols[:8])}")
+                last_universe_refresh = time.monotonic()
+                cursor %= max(1, len(symbols))
+                log(f"Universe: ALL {len(symbols)} active USDT perpetual contracts; rotating in batches of {BATCH_SYMBOLS}")
+            if not symbols:
+                log("No active USDT perpetual contracts returned; waiting")
+                time.sleep(SCAN_SECONDS)
+                continue
+            # Round-robin: cover entire exchange without firing hundreds of requests at once.
+            batch = [symbols[(cursor + i) % len(symbols)] for i in range(min(BATCH_SYMBOLS, len(symbols)))]
+            cursor = (cursor + len(batch)) % len(symbols)
+            con.execute("INSERT OR REPLACE INTO radar_state(key,value) VALUES('cursor',?)", (str(cursor),))
+            con.commit()
             monitor(con)
-            found = scan(con, symbols)
-            log(f"Scan completed: {len(symbols)} symbols; {found} new signal(s)")
+            found = scan(con, batch)
+            log(f"Scan completed: {len(batch)} / {len(symbols)} symbols; {found} new signal(s); next index={cursor}")
             if cycle % 6 == 0:
                 open_count = con.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
                 stats = con.execute("SELECT strategy,status,COUNT(*) FROM trades GROUP BY strategy,status").fetchall()
                 overview = "; ".join(f"{strategy}:{status}={count}" for strategy,status,count in stats)[:700] or "no trades yet"
-                notify(f"💚 ALPER Radar V6 health | {len(symbols)} symbols scanned | {found} new signals | {open_count} open paper signals\n{overview}")
+                notify(f"💚 ALPER Radar V6.1 health | {len(batch)} scanned in batch / {len(symbols)} total | {found} new signals | {open_count} open paper signals\n{overview}")
             cycle += 1
         except KeyboardInterrupt:
             raise
