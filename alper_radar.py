@@ -1,9 +1,9 @@
-"""ALPER Radar V6.1 — Binance USD-M futures PAPER signal radar.
+"""ALPER Radar V6.2 — Binance USD-M futures PAPER signal radar.
 Python 3.11+; standard library only. NEVER submits orders.
 Start: python -u alper_radar.py   Test: python alper_radar.py --self-test
 Telegram secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (Render environment).
-Optional: MIN_TARGET_PCT=5, MIN_VOLUME_RATIO=1.3, BATCH_SYMBOLS=16,
-SCAN_SECONDS=300, REQUEST_GAP_SECONDS=1.5, MAX_STOP_PCT=1.5,
+Optional: MIN_TARGET_PCT=5, MIN_VOLUME_RATIO=1.3, DETAIL_BATCH=12,
+SCAN_SECONDS=60, REQUEST_GAP_SECONDS=2.5, MAX_STOP_PCT=1.5,
 MIN_24H_VOLUME=30000000, SIGNAL_COOLDOWN_HOURS=12, MIN_ADX=18, MIN_SCORE=4.
 Backtest on recent closed data: python alper_radar.py --backtest
 """
@@ -25,10 +25,13 @@ TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TARGET_PCT = float(os.getenv("MIN_TARGET_PCT", "5"))
 VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.3"))
-BATCH_SYMBOLS = max(1, min(40, int(os.getenv("BATCH_SYMBOLS", "16"))))
-WEIGHT_SOFT_LIMIT = max(100, int(os.getenv("WEIGHT_SOFT_LIMIT", "800")))
+DETAIL_BATCH = max(1, min(30, int(os.getenv("DETAIL_BATCH", "12"))))
+HOT_POOL = max(DETAIL_BATCH, min(120, int(os.getenv("HOT_POOL", "60"))))
+CANDIDATE_REFRESH_SECONDS = max(60, int(os.getenv("CANDIDATE_REFRESH_SECONDS", "60")))
+MAX_SIGNAL_AGE_SECONDS = max(60, int(os.getenv("MAX_SIGNAL_AGE_SECONDS", "600")))
+WEIGHT_SOFT_LIMIT = max(100, int(os.getenv("WEIGHT_SOFT_LIMIT", "450")))
 UNIVERSE_REFRESH_SECONDS = max(3600, int(os.getenv("UNIVERSE_REFRESH_SECONDS", "21600")))
-SCAN_SECONDS = max(300, int(os.getenv("SCAN_SECONDS", "300")))
+SCAN_SECONDS = max(60, int(os.getenv("SCAN_SECONDS", "60")))
 REQUEST_GAP = max(2.0, float(os.getenv("REQUEST_GAP_SECONDS", "2.5")))
 STOP_LIMIT = float(os.getenv("MAX_STOP_PCT", "1.5"))
 MIN_TURNOVER = float(os.getenv("MIN_24H_VOLUME", "30000000"))
@@ -65,7 +68,7 @@ def fetch(base, path, params=None, attempts=3):
         if base == BASE:
             _last_api_call = time.monotonic()
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": "ALPER-Radar-Paper/6.0"})
+            request = urllib.request.Request(url, headers={"User-Agent": "ALPER-Radar-Paper/6.2"})
             with urllib.request.urlopen(request, timeout=18) as response:
                 if base == BASE:
                     raw_weight = response.headers.get("X-MBX-USED-WEIGHT-1M")
@@ -383,15 +386,20 @@ def monitor(con):
             log(f"Monitor error {symbol}: {exc}")
 
 
-def scan(con, symbols):
+def scan(con, symbols, cache=None):
     sent = 0
     for symbol in symbols:
         try:
             s5 = candles(symbol, "5m")
-            s15 = candles(symbol, "15m")
-            s1h = candles(symbol, "1h")
+            if cache is None:
+                s15, s1h = candles(symbol, "15m"), candles(symbol, "1h")
+            else:
+                s15, s1h = cached_trend_candles(symbol, cache)
             found = evaluate(s5, s15, s1h)
             if not found:
+                continue
+            # Suppress signals from an outdated 5m close even if the coin rotates back later.
+            if int(time.time() * 1000) - found["close_ms"] > MAX_SIGNAL_AGE_SECONDS * 1000:
                 continue
             side = found["side"]
             now = int(time.time())
@@ -403,7 +411,7 @@ def scan(con, symbols):
                                     (symbol, side, found["close_ms"])).fetchone()
             if duplicate:
                 continue
-            msg = (f"🚨 ALPER Radar V6 | PAPER {side}\n{symbol}\n"
+            msg = (f"🚨 ALPER Radar V6.2 | PAPER {side}\n{symbol}\n"
                    f"Reference entry: {found['entry']:.9g}\n"
                    f"🎯 Target (+{TARGET_PCT:g}% price move): {found['target']:.9g}\n"
                    f"🛑 Stop ({found['stop_pct']:.2f}% price move): {found['stop']:.9g}\n"
@@ -436,7 +444,84 @@ def self_test():
     assert abs(macd_hist([float(x) for x in range(1,80)])) < 1e-4
     con = sqlite3.connect(":memory:")
     assert con.execute("SELECT 1").fetchone()[0] == 1
-    print("SELF-TEST PASS: EMA / RSI / ATR / ADX / MACD / empty data")
+    fake = [{"symbol":"AAAUSDT","quoteVolume":"45000000","priceChangePercent":"5","count":100},
+            {"symbol":"BBBUSDT","quoteVolume":"1000","priceChangePercent":"20","count":10},
+            {"symbol":"OTHER","quoteVolume":"999999999","priceChangePercent":"10","count":999}]
+    assert rank_market(fake, {"AAAUSDT", "BBBUSDT"}) == ["AAAUSDT"]
+    syms = [f"S{i}" for i in range(30)]
+    batch, cursor = pick_batch(syms, ["S15", "S16", "S17"], 0, 0)
+    assert len(batch) == len(set(batch)) == DETAIL_BATCH
+    assert "S15" in batch and cursor > 0
+    print("SELF-TEST PASS: indicators / ranked market / unique rotating batch")
+
+
+def rank_market(tickers, valid_symbols):
+    """One bulk 24h ticker call for the full market; no claim of full candle analysis.
+
+    Prefer active, moving contracts; always leave room for rotation through the
+    rest of the listed universe so no symbol is permanently excluded.
+    """
+    ranked = []
+    for t in tickers:
+        symbol = t.get("symbol")
+        if symbol not in valid_symbols:
+            continue
+        try:
+            turnover = float(t.get("quoteVolume", 0))
+            change = abs(float(t.get("priceChangePercent", 0)))
+            trades = max(0, int(t.get("count", 0)))
+            if not (math.isfinite(turnover) and math.isfinite(change)):
+                continue
+            # Strict volume cutoff applies to HOT ranking, not eligibility for rotating deep scan.
+            if turnover >= MIN_TURNOVER:
+                score = min(change, 30) * 2 + math.log1p(turnover / 1e6) + math.log1p(trades) / 4
+                ranked.append((score, symbol))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [symbol for _, symbol in ranked]
+
+
+def pick_batch(symbols, hot, cursor, cycle):
+    """Half hot candidates, half fair round-robin coverage."""
+    if not symbols:
+        return [], cursor
+    hot_n = min(len(hot), DETAIL_BATCH // 2)
+    start_hot = (cycle * max(1, hot_n)) % max(1, len(hot))
+    selected = []
+    for i in range(hot_n):
+        symbol = hot[(start_hot + i) % len(hot)]
+        if symbol not in selected:
+            selected.append(symbol)
+    visited = 0
+    while len(selected) < min(DETAIL_BATCH, len(symbols)) and visited < len(symbols):
+        symbol = symbols[cursor % len(symbols)]
+        cursor = (cursor + 1) % len(symbols)
+        visited += 1
+        if symbol not in selected:
+            selected.append(symbol)
+    return selected, cursor
+
+
+def cached_trend_candles(symbol, cache):
+    """Don't refetch 15m / 1h klines on every 1-minute loop."""
+    now = time.monotonic()
+    result = []
+    for interval, ttl in (("15m", 600), ("1h", 2400)):
+        key = (symbol, interval)
+        entry = cache.get(key)
+        if not entry or now - entry[0] > ttl:
+            rows = candles(symbol, interval)
+            cache[key] = (time.monotonic(), rows)
+        else:
+            rows = entry[1]
+        result.append(rows)
+    # Prevent unbounded growth from symbols that rotate out.
+    if len(cache) > 1200:
+        for key, value in list(cache.items()):
+            if now - value[0] > 3600:
+                del cache[key]
+    return result
 
 
 def main():
@@ -449,43 +534,52 @@ def main():
     if not (0.2 <= TARGET_PCT <= 30 and 0.3 <= STOP_LIMIT <= 5):
         raise ValueError("Check MIN_TARGET_PCT and MAX_STOP_PCT")
     con = db_connect()
-    log("ALPER Radar V6.1 PAPER started; order execution DISABLED")
-    notify(f"✅ ALPER Radar V6.1 started (PAPER only)\nMinimum target {TARGET_PCT:g}% (coin price, not leverage)\nLONG + SHORT | 5m/15m/1h | ALL active USDT perpetual symbols (rotating)")
+    log("ALPER Radar V6.2 PAPER started; order execution DISABLED")
+    notify(f"✅ ALPER Radar V6.2 started (PAPER only)\nMinimum target {TARGET_PCT:g}% (price, not leverage)\nAll USDT perpetuals bulk-screened; detailed analysis is prioritized and rotating")
     cycle = 0
-    symbols = []
+    symbols, hot = [], []
+    cache = {}
     saved_cursor = con.execute("SELECT value FROM radar_state WHERE key='cursor'").fetchone()
     cursor = int(saved_cursor[0]) if saved_cursor else 0
     last_universe_refresh = 0.0
+    last_screen = 0.0
     while True:
         begun = time.monotonic()
         try:
-            if not symbols or time.monotonic() - last_universe_refresh >= UNIVERSE_REFRESH_SECONDS:
+            if not symbols or begun - last_universe_refresh >= UNIVERSE_REFRESH_SECONDS:
                 symbols = universe()
                 last_universe_refresh = time.monotonic()
                 cursor %= max(1, len(symbols))
-                log(f"Universe: ALL {len(symbols)} active USDT perpetual contracts; rotating in batches of {BATCH_SYMBOLS}")
+                log(f"Listed: {len(symbols)} active USDT perpetual contracts")
             if not symbols:
-                log("No active USDT perpetual contracts returned; waiting")
                 time.sleep(SCAN_SECONDS)
                 continue
-            # Round-robin: cover entire exchange without firing hundreds of requests at once.
-            batch = [symbols[(cursor + i) % len(symbols)] for i in range(min(BATCH_SYMBOLS, len(symbols)))]
-            cursor = (cursor + len(batch)) % len(symbols)
+            if not hot or begun - last_screen >= CANDIDATE_REFRESH_SECONDS:
+                # Single endpoint retrieves 24h market snapshots in bulk.
+                # It does NOT supply per-symbol 1m price/volume acceleration.
+                ticker = fetch(BASE, "/fapi/v1/ticker/24hr")
+                hot = rank_market(ticker, set(symbols))[:HOT_POOL]
+                last_screen = time.monotonic()
+                log(f"Bulk screen: {len(symbols)} listed; {len(hot)} hot candidates")
+            batch, cursor = pick_batch(symbols, hot, cursor, cycle)
             con.execute("INSERT OR REPLACE INTO radar_state(key,value) VALUES('cursor',?)", (str(cursor),))
             con.commit()
-            monitor(con)
-            found = scan(con, batch)
-            log(f"Scan completed: {len(batch)} / {len(symbols)} symbols; {found} new signal(s); next index={cursor}")
-            if cycle % 6 == 0:
+            # A limited number of active trackers are checked each cycle.
+            # Older open signals are checked on later cycles to preserve request budget.
+            if cycle % 5 == 0:
+                monitor(con)
+            found = scan(con, batch, cache)
+            log(f"Detailed scan: {len(batch)} / {len(symbols)} listed; hot={len(hot)}; {found} new signal(s)")
+            if cycle % 30 == 0:
                 open_count = con.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
                 stats = con.execute("SELECT strategy,status,COUNT(*) FROM trades GROUP BY strategy,status").fetchall()
-                overview = "; ".join(f"{strategy}:{status}={count}" for strategy,status,count in stats)[:700] or "no trades yet"
-                notify(f"💚 ALPER Radar V6.1 health | {len(batch)} scanned in batch / {len(symbols)} total | {found} new signals | {open_count} open paper signals\n{overview}")
+                overview = "; ".join(f"{a}:{b}={c}" for a,b,c in stats)[:600] or "no trades yet"
+                notify(f"💚 ALPER Radar V6.2 health | {len(symbols)} bulk-screened | {len(batch)} detailed | {found} signals | {open_count} open paper signals\n{overview}")
             cycle += 1
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            log(f"Cycle warning: {type(exc).__name__} {exc}")
+            log(f"Cycle warning: {type(exc).__name__}: {exc}")
             if "rate-limit" in str(exc):
                 time.sleep(max(65, _pause_until - time.monotonic()))
         time.sleep(max(5, SCAN_SECONDS - (time.monotonic() - begun)))
