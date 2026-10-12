@@ -1,4 +1,4 @@
-"""ALPER Radar V4.2: paper-only Binance USDT perpetual scanner.
+"""ALPER Radar V4.2 + tracker: paper-only Binance USDT perpetual scanner.
 Python 3.11+, standard library only. No order execution.
 Render start: python -u alper_radar.py
 Environment: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (secrets), PAPER_MODE=1.
@@ -10,6 +10,8 @@ Run: python alper_radar.py --self-test
 """
 import datetime as dt
 import json
+import sqlite3
+from pathlib import Path
 import os
 import random
 import sys
@@ -28,6 +30,7 @@ _pause_until = 0.0
 _offset = 0
 _last_health = 0.0
 _last_alert = {}
+DB_PATH = Path(os.getenv("DATA_DIR", ".")) / "alper_radar_results.sqlite3"
 
 
 def envfloat(name, default):
@@ -83,6 +86,133 @@ def send(message):
     if not response.get('ok'):
         raise RuntimeError('Telegram rejected message')
     return True
+
+
+
+def db_open():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(DB_PATH), timeout=20)
+    con.execute("PRAGMA busy_timeout=20000")
+    con.execute("""CREATE TABLE IF NOT EXISTS signals (
+       id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL,
+       method TEXT NOT NULL, candle INTEGER NOT NULL,
+       start_ms INTEGER NOT NULL, expiry_ms INTEGER NOT NULL,
+       entry REAL NOT NULL, stop REAL NOT NULL, target REAL NOT NULL,
+       outcome TEXT NOT NULL DEFAULT 'OPEN', outcome_ms INTEGER,
+       detail TEXT DEFAULT '', notified INTEGER NOT NULL DEFAULT 0,
+       UNIQUE(symbol, side, candle))""")
+    con.commit()
+    return con
+
+
+def track_minutes(method):
+    return int(envfloat('BREAKOUT_TRACK_MINUTES', 30) if method == 'BREAKOUT'
+               else envfloat('PULLBACK_TRACK_MINUTES', 60))
+
+
+def add_signal(con, symbol, signal, sent_ms):
+    # First completely observable minute starts AFTER message delivery.
+    start_ms = ((sent_ms + 59999) // 60000) * 60000
+    expiry_ms = sent_ms + track_minutes(signal['method']) * 60000
+    row = con.execute("""INSERT OR IGNORE INTO signals
+       (symbol,side,method,candle,start_ms,expiry_ms,entry,stop,target)
+       VALUES (?,?,?,?,?,?,?,?,?)""",
+       (symbol, signal['side'], signal['method'], signal['candle'], start_ms,
+        expiry_ms, signal['close'], signal['stop'], signal['target']))
+    con.commit()
+    return row.rowcount > 0
+
+
+def finish(con, signal_id, outcome, when_ms, detail=''):
+    con.execute("""UPDATE signals SET outcome=?, outcome_ms=?, detail=?, notified=0
+                   WHERE id=? AND outcome='OPEN' """,
+                (outcome, when_ms, detail, signal_id))
+    con.commit()
+
+
+def check_one(con, r, now_ms):
+    sid, symbol, side, method, start_ms, expiry_ms, entry, stop, target = r
+    # Observe completed 1m candles only, and never after expiry.
+    end_ms = min(now_ms - 60000, expiry_ms - 60000)
+    if end_ms < start_ms:
+        if now_ms >= expiry_ms:
+            finish(con, sid, 'VERI_EKSIK', now_ms, 'Takip araliginda tam mum yok')
+        return
+    # Work through complete historic minutes from start, including after a restart.
+    cursor = start_ms
+    while cursor <= end_ms:
+        limit_end = min(end_ms, cursor + 999 * 60000)
+        candles = market('/fapi/v1/klines', symbol=symbol, interval='1m',
+                         startTime=cursor, endTime=limit_end + 59999, limit=1000)
+        if not candles:
+            return  # API/data outage: do not invent a result.
+        for bar in candles:
+            bar_ms = int(bar[0])
+            if bar_ms < cursor:
+                continue
+            if bar_ms != cursor:
+                finish(con, sid, 'VERI_EKSIK', now_ms, 'Eksik 1m mum')
+                return
+            if int(bar[6]) >= now_ms:
+                return
+            high, low = float(bar[2]), float(bar[3])
+            hit_stop = low <= stop if side == 'LONG' else high >= stop
+            hit_target = high >= target if side == 'LONG' else low <= target
+            if hit_stop and hit_target:
+                finish(con, sid, 'BELIRSIZ', bar_ms, 'Ayni mumda hedef ve stop')
+                return
+            if hit_stop:
+                finish(con, sid, 'STOP', bar_ms)
+                return
+            if hit_target:
+                finish(con, sid, 'HEDEF', bar_ms)
+                return
+            cursor += 60000
+        if cursor <= limit_end and len(candles) == 0:
+            return
+        if cursor <= limit_end and int(candles[-1][0]) < limit_end:
+            finish(con, sid, 'VERI_EKSIK', now_ms, 'Eksik 1m mum')
+            return
+    if now_ms >= expiry_ms:
+        finish(con, sid, 'SURE_DOLDU', expiry_ms, 'Hedef/stop gorulmedi')
+
+
+def notify_results(con):
+    rows = con.execute("""SELECT id,symbol,side,method,entry,stop,target,outcome,detail
+                          FROM signals WHERE outcome != 'OPEN' AND notified=0
+                          ORDER BY id LIMIT 25""").fetchall()
+    for sid, symbol, side, method, entry, stop, target, outcome, detail in rows:
+        msg = (f'ALPER RADAR | SONUC | {outcome}\n'
+               f'{symbol} | {side} | {method}\n'
+               f'Giris referansi: {entry:.8g}\nStop: {stop:.8g}\n'
+               f'Hedef: {target:.8g}\n'
+               f'{detail}\n'
+               'Sanal takip: emir acilmadi. Sonuclar gecikmeli ve referans fiyat bazlidir.')
+        if send(msg):
+            con.execute('UPDATE signals SET notified=1 WHERE id=?', (sid,))
+            con.commit()
+        else:
+            return
+
+
+def monitor(con):
+    now_ms = int(time.time() * 1000)
+    rows = con.execute("""SELECT id,symbol,side,method,start_ms,expiry_ms,entry,stop,target
+                          FROM signals WHERE outcome='OPEN' ORDER BY id""").fetchall()
+    for r in rows:
+        try:
+            check_one(con, r, now_ms)
+        except RuntimeError as exc:
+            log('Monitor delayed', r[1], str(exc))
+            if 'cooldown' in str(exc) or '429' in str(exc) or '418' in str(exc):
+                break
+    notify_results(con)
+
+
+def stats(con):
+    rows = con.execute("""SELECT method,outcome,COUNT(*) FROM signals
+                          GROUP BY method,outcome""").fetchall()
+    return '; '.join(f'{m} {o}: {n}' for m,o,n in rows) or 'Henuz kayit yok'
 
 
 def ema(values, n):
@@ -170,7 +300,7 @@ def evaluate(five, fifteen, hourly, now_ms):
             'volume': volume_ratio, 'candle': int(last[0])}, 'OK'
 
 
-def scan():
+def scan(con):
     global _offset
     now_ms = int(market('/fapi/v1/time')['serverTime'])
     info = market('/fapi/v1/exchangeInfo')
@@ -202,7 +332,9 @@ def scan():
                 reasons[reason] += 1
                 continue
             key = (symbol, result['side'])
-            if _last_alert.get(key) == result['candle']:
+            exists = con.execute('SELECT 1 FROM signals WHERE symbol=? AND side=? AND candle=?',
+                                 (symbol, result['side'], result['candle'])).fetchone()
+            if exists or _last_alert.get(key) == result['candle']:
                 reasons['DUPLICATE_CANDLE'] += 1
                 continue
             message = (f'ALPER RADAR V4.2 | DENEME | {result["side"]} ADAYI\n'
@@ -214,6 +346,7 @@ def scan():
                        f'Hacim oranı: {result["volume"]:.2f}x\n'
                        'Sinyal deneysel ve gecikmelidir. Referanslar emir değildir; başarı doğrulanmadı.')
             if send(message):
+                add_signal(con, symbol, result, int(time.time() * 1000))
                 _last_alert[key] = result['candle']
                 alerts += 1
                 log('ALERT', symbol, result['side'], result['method'])
@@ -233,14 +366,16 @@ def main():
         raise RuntimeError('This version is PAPER ONLY. Set PAPER_MODE=1.')
     if not TOKEN or not CHAT:
         raise RuntimeError('Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in Render environment secrets.')
-    send('ALPER Radar V4.2 başlatıldı | DENEME modu | Emir açılmaz. Tarama ve durum mesajları aktif.')
+    con = db_open()
+    send('ALPER Radar V4.2 + TAKIP baslatildi | DENEME modu | 30/60 dk otomatik sonuc takibi. Emir acilmaz.')
     while True:
         try:
             if time.monotonic() < _pause_until:
                 log('Cooldown active; remaining seconds', int(_pause_until-time.monotonic()))
                 time.sleep(min(60, _pause_until-time.monotonic()))
                 continue
-            count, alerts, reasons = scan()
+            monitor(con)
+            count, alerts, reasons = scan(con)
             log('Scan complete:', count, 'alerts:', alerts, 'rejections:', dict(reasons))
             if time.monotonic() - _last_health >= envfloat('HEALTH_INTERVAL_SECONDS', 1800):
                 top = ', '.join(f'{k}: {v}' for k,v in reasons.most_common(7)) or 'yok'
@@ -266,7 +401,8 @@ def self_test():
     assert evaluate([], [], [], 1000000)[1] == 'INSUFFICIENT_DATA'
     assert closed([[0,1,2,0,1,1,59999]], 60000)
     assert not closed([[0,1,2,0,1,1,59999]], 59999)
-    print('PASS: EMA, empty data, insufficient data, closed-candle handling')
+    assert track_minutes('BREAKOUT') == 30 and track_minutes('PULLBACK') == 60
+    print('PASS: EMA, empty data, closed candles, tracking windows')
 
 
 if __name__ == '__main__':
