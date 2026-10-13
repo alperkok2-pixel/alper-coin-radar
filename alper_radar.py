@@ -1,4 +1,4 @@
-"""ALPER Radar V8.6 BALANCED | paper-only Binance USD-M perpetuals.
+"""ALPER Radar V8.6.1 BALANCED API GUARD | paper-only Binance USD-M perpetuals.
 Python 3.11+, websocket-client==1.9.0. No exchange keys or orders.
 Run: python -u alper_radar.py ; test: python alper_radar.py --self-test
 Env: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, RADAR_DB=/var/data/alper_radar.sqlite3,
@@ -6,7 +6,7 @@ FOLLOW_COUNT=60, FOLLOW_REFRESH_SECONDS=60, MIN_24H_QUOTE=15000000.
 Experimental heuristics; no validated profitability or advance warning guarantee.
 """
 from __future__ import annotations
-import collections, datetime as dt, fcntl, json, logging, math, os, random, signal, sqlite3, sys, threading, time, urllib.parse, urllib.request
+import collections, datetime as dt, fcntl, json, logging, math, os, random, signal, sqlite3, sys, threading, time, urllib.parse, urllib.request, urllib.error, email.utils
 from dataclasses import dataclass, field
 from pathlib import Path
 try: import websocket
@@ -40,9 +40,57 @@ def number(x,default=0.):
     try:
         v=float(x); return v if math.isfinite(v) else default
     except (ValueError,TypeError,OverflowError): return default
+class ApiRateGuard:
+    """Shared REST pacing and Binance 429/418 circuit breaker."""
+    def __init__(self, interval=1.5):
+        self.lock=threading.Lock()
+        self.interval=interval
+        self.next_allowed=0.0
+        self.blocked_until=0.0
+        self.failures=0
+    def wait(self):
+        while not STOP.is_set():
+            with self.lock:
+                now=time.monotonic()
+                due=max(self.next_allowed,self.blocked_until)
+                if now>=due:
+                    self.next_allowed=now+self.interval
+                    return True
+                delay=min(2.0,due-now)
+            STOP.wait(delay)
+        return False
+    def reject(self, error):
+        retry=error.headers.get('Retry-After') if error.headers else None
+        seconds=None
+        if retry:
+            try: seconds=max(0,float(retry))
+            except (ValueError,TypeError):
+                try:
+                    date=email.utils.parsedate_to_datetime(retry)
+                    seconds=max(0,date.timestamp()-time.time())
+                except (ValueError,TypeError,OverflowError):pass
+        with self.lock:
+            self.failures+=1
+            if seconds is None: seconds=min(300,30*2**min(self.failures-1,4))
+            if error.code==418: seconds=max(seconds,300)
+            seconds=max(5,min(900,seconds))
+            self.blocked_until=max(self.blocked_until,time.monotonic()+seconds)
+        LOG.warning('REST_BACKOFF status=%s pause=%.0fs consecutive=%d',error.code,seconds,self.failures)
+    def success(self):
+        with self.lock:self.failures=0
+
+API_GUARD=ApiRateGuard(float(os.getenv('REST_MIN_INTERVAL_SECONDS','1.5')))
 def api(path):
-    req=urllib.request.Request(REST+path,headers={'User-Agent':'ALPER-Paper-Radar/8.6'})
-    with urllib.request.urlopen(req,timeout=20) as resp: return json.load(resp)
+    if not API_GUARD.wait():raise RuntimeError('REST stopped')
+    req=urllib.request.Request(REST+path,headers={'User-Agent':'ALPER-Paper-Radar/8.6.1'})
+    try:
+        with urllib.request.urlopen(req,timeout=20) as resp: data=json.load(resp)
+        API_GUARD.success()
+        return data
+    except urllib.error.HTTPError as exc:
+        if exc.code in (418,429): API_GUARD.reject(exc)
+        raise
+
 def universe():
     return {x['symbol'] for x in api('/fapi/v1/exchangeInfo').get('symbols',[])
             if x.get('status')=='TRADING' and x.get('contractType')=='PERPETUAL' and x.get('quoteAsset')=='USDT'}
@@ -439,7 +487,14 @@ def self_test():
         assert restored.update_price('SHORTUSDT',r[2]+.01,t+2000)==[(r[0],'STOP')]
         assert restored.update_price('SHORTUSDT',r[1]-.01,t+3000)==[]
         assert 'STOP=1' in restored.report()
-    print('PASS V8.6: LONG/SHORT, trend, quality, watch, cooldown, TP/STOP, stale ticks, duplicate guard, persistent outbox, restart, estimated costs')
+    import io
+    guard=ApiRateGuard(.01)
+    err=urllib.error.HTTPError('https://example.invalid',429,'Too Many Requests',{'Retry-After':'12'},io.BytesIO())
+    guard.reject(err)
+    assert guard.blocked_until-time.monotonic()>10
+    assert guard.failures==1
+    guard.success();assert guard.failures==0
+    print('PASS V8.6.1: LONG/SHORT, trend, quality, watch, cooldown, TP/STOP, stale ticks, duplicate guard, persistent outbox, restart, estimated costs')
 def main():
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
     if '--self-test' in sys.argv:return self_test()
