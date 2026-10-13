@@ -1,4 +1,4 @@
-"""ALPER Radar V8.5 QUALITY | PAPER ONLY, Binance USD-M USDT perpetuals.
+"""ALPER Radar V8.5 QUALITY + DIAGNOSTICS | PAPER ONLY, Binance USD-M USDT perpetuals.
 Python 3.11+; pip install websocket-client==1.9.0
 Run: python -u alper_radar.py | Test: python alper_radar.py --self-test
 Environment: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, FOLLOW_COUNT=60,
@@ -299,6 +299,7 @@ class Radar:
         self.next_follow=set(); self.rotation=0; self.candidate_updated=0
         self.last_market=0; self.last_trade=0; self.last_status=0
         self.trend={}; self.last_report=now_ms()
+        self.diagnostics=collections.Counter()
 
     def bootstrap(self):
         self.allowed=universe()
@@ -371,17 +372,37 @@ class Radar:
             snapshot=list(state.trades);price=p.price;updated=p.updated
         current=now_ms()
         if self.db.open_exists(sym):return
+        self.diagnostics['eligible_ticks']+=1
         watch=analyze(snapshot,price,updated,current,'watch')
         if watch and not self.db.recent('watches',sym,watch['direction'],current,WATCH_COOLDOWN):
             self.db.watch(current,sym,watch)
+            self.diagnostics['watch_created']+=1
             LOG.info('WATCH %s %s recorded (Telegram muted)',sym,watch['direction'])
         confirmed=analyze(snapshot,price,updated,current,'confirm')
-        if not confirmed:return
+        if not confirmed:
+            self.diagnostics['base_filter_no_match']+=1
+            return
+        self.diagnostics['base_pass']+=1
         trend=self.trend_snapshot(sym)
-        if not trend_allows(confirmed['direction'],trend):return
-        if not quality_allows(confirmed,trend):return
+        if not trend:
+            self.diagnostics['trend_missing_or_stale']+=1
+            return
+        if not trend_allows(confirmed['direction'],trend):
+            self.diagnostics['trend_mismatch']+=1
+            return
+        self.diagnostics['trend_pass']+=1
+        if not quality_allows(confirmed,trend):
+            if QUALITY_REQUIRE_5M and trend.get('5m')!=confirmed['direction']:
+                self.diagnostics['quality_5m_mismatch']+=1
+            else:
+                self.diagnostics['quality_strength_burst_flow_move']+=1
+            return
+        self.diagnostics['quality_pass']+=1
         recorded=self.db.confirmed_if_eligible(current,sym,confirmed,trend)
+        if not recorded:
+            self.diagnostics['database_watch_cooldown_or_duplicate']+=1
         if recorded:
+            self.diagnostics['confirmed']+=1
             id_,tp,sl,delay=recorded
             LOG.info('CONFIRMED %s %s #%d TP=%.9g STOP=%.9g delay_ms=%d',sym,confirmed['direction'],id_,tp,sl,delay)
 
@@ -530,6 +551,9 @@ class Radar:
                          (t-self.last_market)/1000 if self.last_market else -1,
                          (t-self.last_trade)/1000 if self.last_trade else -1,
                          len(self.followed),len(self.db.open_symbols()))
+                LOG.info('DIAG_60S %s', ' '.join(
+                    f'{k}={v}' for k,v in sorted(self.diagnostics.items())) or 'no_eligible_ticks')
+                self.diagnostics.clear()
                 self.last_status=t
             if t-self.last_report>=REPORT_INTERVAL*1000:
                 LOG.info(self.db.report());self.last_report=t
