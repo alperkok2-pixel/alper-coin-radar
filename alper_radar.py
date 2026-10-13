@@ -1,11 +1,11 @@
-"""ALPER Radar V8.4 TREND | PAPER ONLY, Binance USD-M USDT perpetuals.
+"""ALPER Radar V8.5 QUALITY | PAPER ONLY, Binance USD-M USDT perpetuals.
 Python 3.11+; pip install websocket-client==1.9.0
 Run: python -u alper_radar.py | Test: python alper_radar.py --self-test
 Environment: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, FOLLOW_COUNT=60,
 FOLLOW_REFRESH_SECONDS=60, RADAR_DB=/var/data/alper_radar.sqlite3 (persistent Render disk),
 MIN_24H_QUOTE=15000000. No orders, no exchange account keys.
 Experimental paper signal system, NOT a validated trading strategy.
-V8.4 TREND: require fresh 15m and 1h trend agreement for confirmations.
+V8.5 QUALITY: retain V8.4 trend checks; configurable quality gate for confirmed signals.
 """
 from __future__ import annotations
 import collections
@@ -49,6 +49,14 @@ COOLDOWN_SECONDS = 3 * 3600
 WATCH_COOLDOWN = 20 * 60
 REPORT_INTERVAL = max(1800, int(os.getenv('REPORT_INTERVAL_SECONDS', '3600')))
 TREND_REFRESH = max(300, int(os.getenv('TREND_REFRESH_SECONDS', '900')))
+# Extra quality conditions are experimental and not proven to improve outcomes.
+# Set QUALITY_ENABLED=0 to restore the V8.4 trend-only entry gate.
+QUALITY_ENABLED = os.getenv('QUALITY_ENABLED', '1') == '1'
+QUALITY_FLOW_RATIO = float(os.getenv('QUALITY_FLOW_RATIO', '0.78'))
+QUALITY_BURST_RATIO = float(os.getenv('QUALITY_BURST_RATIO', '2.2'))
+QUALITY_MIN_FLOW_USDT = float(os.getenv('QUALITY_MIN_FLOW_USDT', '20000'))
+QUALITY_MAX_MOVE_PCT = float(os.getenv('QUALITY_MAX_MOVE_PCT', '0.18'))
+QUALITY_REQUIRE_5M = os.getenv('QUALITY_REQUIRE_5M', '1') == '1'
 STOP = threading.Event()
 
 def now_ms(): return int(time.time() * 1000)
@@ -59,7 +67,7 @@ def number(x, default=0.):
     except (TypeError, ValueError, OverflowError): return default
 
 def api(path):
-    req = urllib.request.Request(REST + path, headers={'User-Agent': 'ALPER-Paper-Radar/8.4-trend'})
+    req = urllib.request.Request(REST + path, headers={'User-Agent': 'ALPER-Paper-Radar/8.5-quality'})
     with urllib.request.urlopen(req, timeout=20) as response: return json.load(response)
 
 def universe():
@@ -130,6 +138,18 @@ def trend_allows(direction, trend):
     return direction in ('LONG', 'SHORT') and all(
         trend.get(frame) == direction for frame in ('15m', '1h'))
 
+def quality_allows(val, trend):
+    """Additional conservative heuristics; not a calibrated probability model."""
+    if not QUALITY_ENABLED: return True
+    direction = val.get('direction')
+    if QUALITY_REQUIRE_5M and trend.get('5m') != direction: return False
+    metrics = (val.get('strength'), val.get('burst'), val.get('flow'), val.get('move'))
+    if any(not isinstance(x, (int,float)) or not math.isfinite(x) for x in metrics):
+        return False
+    strength, burst, flow, move = metrics
+    return (strength >= QUALITY_FLOW_RATIO and burst >= QUALITY_BURST_RATIO
+            and flow >= QUALITY_MIN_FLOW_USDT and 0.045 <= move <= QUALITY_MAX_MOVE_PCT)
+
 class Database:
     def __init__(self, path=DB):
         self.lock = threading.RLock()
@@ -183,6 +203,7 @@ class Database:
         p=val['price']; direction=val['direction']; islong=direction=='LONG'
         # Gate again at the database entry point, not just the websocket caller.
         if not trend_allows(direction, trend or {}): return None
+        if not quality_allows(val, trend or {}): return None
         tp=p*(1.015 if islong else .985)
         sl=p*(.9925 if islong else 1.0075)
         with self.lock:
@@ -198,10 +219,10 @@ class Database:
             id_=cur.lastrowid
             self.con.execute("UPDATE watches SET status='CONFIRMED',resolved=? WHERE symbol=? AND direction=? AND status='WATCH' AND created>=?",
                              (ts,sym,direction,ts-10*60*1000))
-            msg=(f'✅ ALPER V8.4 TREND | ONAYLI SANAL {direction}\n{sym} | giriş referansı: {p:.9g}\n'
+            msg=(f'✅ ALPER V8.5 QUALITY | ONAYLI SANAL {direction}\n{sym} | giriş referansı: {p:.9g}\n'
                  f'TP (+1.5%): {tp:.9g}\nSTOP (-0.75%): {sl:.9g}\n'
                  f'Akış baskısı %{val["strength"]*100:.0f}, ivme {val["burst"]:.1f}x | '
-                 f'fiyat hareketi %{val["move"]:.2f}\n15m ve 1h trend onaylı\n'
+                 f'fiyat hareketi %{val["move"]:.2f}\n15m ve 1h trend onaylı; kalite filtresi aktif\n'
                  f'Kayıt #{id_} | işlem tavsiyesi değildir.')
             self._outbox(id_,'entry',msg,ts)
             self.con.commit()
@@ -235,7 +256,7 @@ class Database:
                 if not changed:continue
                 gross=(price/entry-1)*100*(1 if direction=='LONG' else -1)
                 self.con.execute('UPDATE signals SET gross_pct=? WHERE id=?',(gross,id_))
-                msg=(f'🏁 ALPER V8.4 | SANAL SONUÇ #{id_}\n{sym} {direction} | {result}\n'
+                msg=(f'🏁 ALPER V8.5 | SANAL SONUÇ #{id_}\n{sym} {direction} | {result}\n'
                      f'Giriş: {entry:.9g} | gözlenen çıkış: {price:.9g}\n'
                      f'Brüt fiyat hareketi: {gross:+.2f}% (komisyon/kayma hariç)')
                 self._outbox(id_,'result',msg,now_ms())
@@ -358,6 +379,7 @@ class Radar:
         if not confirmed:return
         trend=self.trend_snapshot(sym)
         if not trend_allows(confirmed['direction'],trend):return
+        if not quality_allows(confirmed,trend):return
         recorded=self.db.confirmed_if_eligible(current,sym,confirmed,trend)
         if recorded:
             id_,tp,sl,delay=recorded
@@ -519,6 +541,12 @@ def self_test():
     assert not trend_allows('LONG', {'15m':'LONG','1h':'SHORT'})
     assert not trend_allows('SHORT', {'15m':'SHORT'})
     assert not trend_allows('LONG', {})
+    assert quality_allows({'direction':'LONG','strength':.90,'burst':3,'flow':30000,'move':.1},
+                          {'5m':'LONG'})
+    assert not quality_allows({'direction':'LONG','strength':.70,'burst':3,'flow':30000,'move':.1},
+                              {'5m':'LONG'})
+    assert not quality_allows({'direction':'LONG','strength':.9,'burst':3,'flow':30000,'move':.1},
+                              {'5m':'SHORT'})
     with tempfile.TemporaryDirectory() as temp:
         path=str(Path(temp)/'test.sqlite3')
         db=Database(path);t=now_ms()
@@ -529,12 +557,14 @@ def self_test():
             trades.append((stamp,px,300 if i<50 else 900,1 if i%10 else -1))
         val=analyze(trades,100.12,t,t,'confirm')
         assert val and val['direction']=='LONG',val
+        val.update(strength=.90,burst=3.,flow=30000.,move=.1)
         assert analyze(trades,100.12,t-8000,t,'confirm') is None
         short=[(stamp,200-2*(price-100),flow,-side) for stamp,price,flow,side in trades]
         sv=analyze(short,199.76,t,t,'confirm')
         assert sv and sv['direction']=='SHORT',sv
-        longtrend={'5m':'SHORT','15m':'LONG','1h':'LONG'}
-        shorttrend={'5m':'LONG','15m':'SHORT','1h':'SHORT'}
+        sv.update(strength=.90,burst=3.,flow=30000.,move=.1)
+        longtrend={'5m':'LONG','15m':'LONG','1h':'LONG'}
+        shorttrend={'5m':'SHORT','15m':'SHORT','1h':'SHORT'}
         assert db.confirmed_if_eligible(t,'TESTUSDT',val,longtrend) is None
         db.watch(t-1000,'TESTUSDT',val)
         assert db.confirmed_if_eligible(t,'TESTUSDT',val,{'15m':'LONG'}) is None
@@ -561,7 +591,7 @@ def self_test():
         assert restored.update_price('SHORTUSDT',result[2]+.01,t+2000)==[(result[0],'STOP')]
         assert restored.update_price('SHORTUSDT',result[1]-.01,t+3000)==[]
         assert 'STOP=1' in restored.report()
-    print('PASS V8.4 TREND: LONG/SHORT gating, missing/conflicting trends, watches, cooldown, TP/STOP, stale-tick guard, duplicate guard, persistent outbox, restart')
+    print('PASS V8.5 QUALITY: LONG/SHORT gating, missing/conflicting trends, watches, cooldown, TP/STOP, stale-tick guard, duplicate guard, persistent outbox, restart')
 
 def main():
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
